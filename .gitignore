@@ -1,0 +1,10 @@
+__pycache__/
+.tmp/
+
+# Runtime prompt file the CLI creates in its working directory.
+/prompt.md
+
+.venv/
+
+# Generated from uv.lock by: make requirements
+/requirements.txt
