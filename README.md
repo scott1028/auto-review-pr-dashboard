@@ -46,7 +46,7 @@ auto-review-pr-dashboard -l
   --reviewer LOGIN           filter by reviewer login (repeatable)
 
   --interval MIN      minutes between loops (default: 60)
-  --pr-timeout MIN    kill one PR's AI process after this long (default: 20)
+  --pr-timeout MIN    kill one PR's AI process after this long (default: 30)
   --cooldown MIN      wait this long after a suspected usage limit (default: 30)
   --dry-run           discover, print the verdict table, review nothing
   -l, --list          list working directories with a live daemon to resume
@@ -113,7 +113,7 @@ persists it, so later edits — and `--resume` — never change that run.
 
 Why the extra hop, instead of running the loop inside the TUI:
 
-- **A review outlives its terminal.** One PR can take 20 minutes and a loop runs for
+- **A review outlives its terminal.** One PR can take 30 minutes and a loop runs for
   hours; as a child of the terminal, the agent dies with a closed tab or a lost SSH
   session. The daemon is spawned with `start_new_session`, so `d`, a closed window and
   a dropped connection all leave the work running.

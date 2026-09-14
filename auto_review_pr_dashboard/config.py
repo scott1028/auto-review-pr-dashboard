@@ -117,6 +117,6 @@ class RunConfig:
     reviewers: list = field(default_factory=list)
     urls: list = field(default_factory=list)
     interval_min: int = 60
-    pr_timeout_min: int = 20
+    pr_timeout_min: int = 30
     cooldown_min: int = 30
     dry_run: bool = False

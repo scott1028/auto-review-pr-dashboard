@@ -572,6 +572,7 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                 class DeadChildStdin(io.BytesIO):
                     def close(self):
                         # A buffered payload only meets the dead pipe on flush.
+                        super().close()
                         raise BrokenPipeError(32, "Broken pipe")
 
                 class DeadProcess:
@@ -601,6 +602,7 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("exited with 1", message)
                 self.assertIn("ModuleNotFoundError", message)
                 self.assertNotIn("Broken pipe", message)
+                self.assertTrue(process.stdin.closed)
                 self.assertTrue(process.reaped.wait(1))
             finally:
                 os.chdir(original_cwd)

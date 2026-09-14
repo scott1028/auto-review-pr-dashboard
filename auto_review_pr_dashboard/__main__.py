@@ -111,9 +111,9 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pr-timeout",
         type=int,
-        default=20,
+        default=30,
         metavar="MIN",
-        help="kill one PR's AI process after this long (default: 20)",
+        help="kill one PR's AI process after this long (default: 30)",
     )
     parser.add_argument(
         "--cooldown",
