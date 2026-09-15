@@ -10,6 +10,7 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, RichLog, Static
 
@@ -193,8 +194,8 @@ class DetailScreen(Screen):
 
     BINDINGS = [
         Binding("escape,backspace", "app.pop_screen", "back"),
-        Binding("c", "cancel", "cancel this PR"),
-        Binding("r", "resume", "resume"),
+        Binding("c", "cancel", "cancel selected PR"),
+        Binding("r", "resume", "requeue cancelled PR"),
         Binding("f", "toggle_follow", "follow log"),
     ]
 
@@ -401,16 +402,18 @@ class AutoReviewPrDashboardApp(App):
 
     BINDINGS = [
         Binding("enter", "open_detail", "detail"),
-        Binding("c", "cancel", "cancel"),
-        Binding("r", "resume", "resume"),
-        Binding("n", "run_now", "run now"),
-        Binding("p", "toggle_pause", "pause"),
-        Binding("d", "background", "background"),
-        Binding("l", "toggle_activity_log", "agent log"),
-        Binding("q", "quit_app", "quit"),
+        Binding("c", "cancel", "cancel selected PR"),
+        Binding("r", "resume", "requeue cancelled PR"),
+        Binding("n", "run_now", "skip countdown"),
+        Binding("p", "toggle_pause", "pause after current PR"),
+        Binding("p", "resume_queue", "resume queue"),
+        Binding("d", "background", "keep running in background"),
+        Binding("l", "toggle_activity_log", "toggle agent log"),
+        Binding("q", "quit_app", "stop & quit"),
     ]
 
     TITLE = "auto-review-pr-dashboard"
+    paused = reactive(False, bindings=True)
 
     def __init__(
         self,
@@ -425,7 +428,6 @@ class AutoReviewPrDashboardApp(App):
         self.runner: LoopRunner | None = None
         self.record = None
         self.status = "starting"
-        self.paused = False
         self.idle_remaining: float | None = None
         self.next_run_at: float | None = None
         self.block_reason = ""
@@ -451,6 +453,13 @@ class AutoReviewPrDashboardApp(App):
         )
         yield PrTable(id="pr-table", cursor_type="row", zebra_stripes=True)
         yield Footer()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "toggle_pause":
+            return not self.paused
+        if action == "resume_queue":
+            return self.paused
+        return True
 
     def on_mount(self) -> None:
         add_table_columns(self.query_one(PrTable))
@@ -802,6 +811,8 @@ class AutoReviewPrDashboardApp(App):
         elif self.runner:
             paused = self.runner.toggle_pause()
             self.notify("paused after the current PR" if paused else "resumed")
+
+    action_resume_queue = action_toggle_pause
 
     def action_background(self) -> None:
         if self.session is None:

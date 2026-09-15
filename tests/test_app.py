@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rich.text import Text
-from textual.widgets import RichLog, Static
+from textual.widgets import Footer, RichLog, Static
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -140,6 +140,64 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertIsInstance(app.screen, DetailScreen)
             self.assertEqual(app.screen.pr_key, "o/r#15")
+
+    async def test_footer_labels_explain_actions_and_pause_state(self):
+        app = self.app
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            bindings = app.screen.active_bindings
+            self.assertEqual(
+                {key: bindings[key].binding.description for key in "crnpdlq"},
+                {
+                    "c": "cancel selected PR",
+                    "r": "requeue cancelled PR",
+                    "n": "skip countdown",
+                    "p": "pause after current PR",
+                    "d": "keep running in background",
+                    "l": "toggle agent log",
+                    "q": "stop & quit",
+                },
+            )
+
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertTrue(app.paused)
+            self.assertEqual(
+                app.screen.active_bindings["p"].binding.description,
+                "resume queue",
+            )
+            self.assertEqual(
+                [
+                    key.description
+                    for key in app.query_one(Footer).query("FooterKey")
+                    if key.key == "p"
+                ],
+                ["resume queue"],
+            )
+
+            await pilot.press("p")
+            await pilot.pause()
+            self.assertFalse(app.paused)
+            self.assertEqual(
+                app.screen.active_bindings["p"].binding.description,
+                "pause after current PR",
+            )
+            self.assertEqual(
+                [
+                    key.description
+                    for key in app.query_one(Footer).query("FooterKey")
+                    if key.key == "p"
+                ],
+                ["pause after current PR"],
+            )
+
+    def test_detail_footer_labels_explain_selected_pr_actions(self):
+        descriptions = {
+            binding.key: binding.description for binding in DetailScreen.BINDINGS
+        }
+
+        self.assertEqual(descriptions["c"], "cancel selected PR")
+        self.assertEqual(descriptions["r"], "requeue cancelled PR")
 
     def test_wip_skip_reason_text(self):
         item = make_item(12, state=PrState.SKIP, verdict=Verdict.SKIP)
