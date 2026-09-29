@@ -36,7 +36,7 @@ Without uv, `pip install .` plus `python3 -m auto_review_pr_dashboard` works.
 ## Usage
 
 ```bash
-auto-review-pr-dashboard <ai_cli> [<prompt>] [options]
+auto-review-pr-dashboard <ai_cli> [<prompt>] [options] [-- <ai_cli args>...]
 auto-review-pr-dashboard --resume
 auto-review-pr-dashboard -l
   scope — at least one of --repo-url / --pr-url is required:
@@ -50,11 +50,11 @@ auto-review-pr-dashboard -l
   --cooldown MIN      wait this long after a suspected usage limit (default: 30)
   --dry-run           discover, print the verdict table, review nothing
   -l, --list          list working directories with a live daemon to resume
-```
+  -- ARGS...          pass ARGS to <ai_cli> after its built-in flags, before the prompt
 
-```bash
 auto-review-pr-dashboard codex --repo-url owner/repo --author <login> --dry-run
 auto-review-pr-dashboard claude --pr-url https://github.com/owner/repo/pull/<n>
+auto-review-pr-dashboard codex --pr-url https://github.com/owner/repo/pull/<n> -- --yolo
 ```
 
 The prompt says *how* to review, the flags say *which* PRs — scope is never inferred

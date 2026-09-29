@@ -89,7 +89,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
             return await loop_runner.run_loop()
 
     async def test_prompt_is_forwarded_to_each_agent(self):
-        loop_runner = self.make_runner([make_item(1)])
+        loop_runner = self.make_runner([make_item(1)], ai_cli_args=["--yolo"])
 
         await self.run_loop(loop_runner)
 
@@ -103,7 +103,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
                         "o/r",
                         "https://github.com/o/r/pull/1",
                     ),
-                    {},
+                    {"ai_cli_args": ["--yolo"]},
                 )
             ],
         )

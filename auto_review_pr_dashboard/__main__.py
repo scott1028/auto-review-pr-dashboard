@@ -26,11 +26,16 @@ USAGE_EXAMPLES = """prompt file:
     1. Focus on finding bugs.
     2. Treat missing tests as non-blocking; do not hold the feature release.
 
+ai_cli arguments:
+  Everything after `--` is passed to <ai_cli> unchanged, after its built-in flags
+  and before the prompt.
+
 examples:
   auto-review-pr-dashboard codex --repo-url https://github.com/owner/repo --author <author-username> --dry-run
   auto-review-pr-dashboard codex --repo-url https://github.com/<owner>/<repo1> --repo-url https://github.com/<owner>/<repo2> --author <author-username> --reviewer <reviewer-username>
   auto-review-pr-dashboard codex --pr-url https://github.com/<owner>/<repo>/pull/<pr-number>
   auto-review-pr-dashboard claude --pr-url https://github.com/<owner>/<repo>/pull/<pr-number>
+  auto-review-pr-dashboard codex --pr-url https://github.com/<owner>/<repo>/pull/<pr-number> -- --yolo
   auto-review-pr-dashboard --resume
   auto-review-pr-dashboard -l
 """
@@ -166,7 +171,14 @@ def get_scope_flags(parser, args) -> tuple[list[str], list[str]]:
 def parse_args(argv: list[str] | None = None) -> RunConfig | None:
     parser = get_parser()
     raw_args = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(raw_args)
+    # Everything after the first `--` goes to the AI CLI unchanged.
+    ai_cli_args = []
+    parser_args = raw_args
+    if "--" in raw_args:
+        split_index = raw_args.index("--")
+        parser_args = raw_args[:split_index]
+        ai_cli_args = raw_args[split_index + 1 :]
+    args = parser.parse_args(parser_args)
 
     if args.resume:
         if raw_args != ["--resume"]:
@@ -226,6 +238,7 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
         pr_timeout_min=args.pr_timeout,
         cooldown_min=args.cooldown,
         dry_run=args.dry_run,
+        ai_cli_args=ai_cli_args,
     )
 
 

@@ -366,6 +366,7 @@ class LoopRunner:
             self.config.prompt,
             item.repo,
             item.url,
+            ai_cli_args=self.config.ai_cli_args,
         )
         try:
             run = await self._spawn_agent(

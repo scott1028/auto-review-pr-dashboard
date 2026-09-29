@@ -42,6 +42,8 @@ class ConfigParityTest(unittest.TestCase):
             "--reviewer <reviewer-username>",
             "auto-review-pr-dashboard codex --pr-url "
             "https://github.com/<owner>/<repo>/pull/<pr-number>",
+            "auto-review-pr-dashboard codex --pr-url "
+            "https://github.com/<owner>/<repo>/pull/<pr-number> -- --yolo",
             "auto-review-pr-dashboard --resume",
             "auto-review-pr-dashboard -l",
         )
@@ -83,6 +85,11 @@ class ConfigParityTest(unittest.TestCase):
         )
         self.assertEqual(command[:4], ["bash", "-c", '"$0" "$@"', "codex-personal"])
         self.assertEqual(command[4:-1], AI_CLI_FLAGS["codex"])
+        command = get_ai_command(
+            "codex", "review", "owner/repo", "https://x/pull/7", ai_cli_args=["--yolo"]
+        )
+        self.assertEqual(command[4:-1], [*AI_CLI_FLAGS["codex"], "--yolo"])
+        self.assertIn("https://x/pull/7", command[-1])
 
     def test_scoped_prompt_contract(self):
         prompt = get_scoped_prompt(
@@ -256,13 +263,14 @@ class ConfigParityTest(unittest.TestCase):
             "CODEX_PROFILE": "/tmp/codex-personal",
         }
         command = get_ai_command(
-            "codex-stub", "review", "owner/repo", "https://x/pull/7"
+            "codex-stub", "review", "owner/repo", "https://x/pull/7", ["--yolo"]
         )
         result = subprocess.run(
             command, capture_output=True, text=True, env=env, check=False
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("stub got: exec -s workspace-write", result.stdout)
+        self.assertIn("--skip-git-repo-check --yolo", result.stdout)
         self.assertNotIn("review-pr-branches", result.stdout)
         self.assertIn("https://x/pull/7", result.stdout)
         self.assertIn("profile=/tmp/codex-personal", result.stdout)
@@ -305,10 +313,23 @@ class ConfigParityTest(unittest.TestCase):
         )
         self.assertEqual(config.urls, ["https://github.com/o/r/pull/7"])
         self.assertEqual(config.authors, [])
+        self.assertEqual(config.ai_cli_args, [])
+
+        config = parse_args(
+            shlex.split("codex --pr-url https://github.com/o/r/pull/7 -- --yolo")
+        )
+        self.assertEqual(config.urls, ["https://github.com/o/r/pull/7"])
+        self.assertEqual(config.ai_cli_args, ["--yolo"])
+
+        config = parse_args(
+            shlex.split("codex --pr-url https://github.com/o/r/pull/7 -- --a -- b")
+        )
+        self.assertEqual(config.ai_cli_args, ["--a", "--", "b"])
 
     def test_invalid_arguments_matrix(self):
         cases = (
             "--resume --dry-run",
+            "--resume -- --yolo",
             "--resume codex review --repo-url o/r --author me",
             "codex review --repo-url o/r --author me --resume",
             "-l --dry-run",

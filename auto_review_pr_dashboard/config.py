@@ -61,7 +61,7 @@ def get_scoped_prompt(prompt, repo, url):
     return prompt + SCOPE_PROMPT_TEMPLATE.format(url=url, repo=repo)
 
 
-def get_ai_command(ai_cli, prompt, repo, url):
+def get_ai_command(ai_cli, prompt, repo, url, ai_cli_args=()):
     """Full argv for reviewing one PR, run through bash.
 
     Most of these CLIs are bash functions from `~/.bashrc.d/*`, not binaries -
@@ -71,12 +71,21 @@ def get_ai_command(ai_cli, prompt, repo, url):
     the launcher (`export -f`) before falling back to PATH.
     """
     scoped_prompt = get_scoped_prompt(prompt, repo, url)
-    return get_agent_command(ai_cli, scoped_prompt)
+    return get_agent_command(ai_cli, scoped_prompt, ai_cli_args)
 
 
-def get_agent_command(ai_cli, prompt):
+def get_agent_command(ai_cli, prompt, ai_cli_args):
     family = get_ai_cli_family(ai_cli)
-    return ["bash", "-c", '"$0" "$@"', ai_cli, *AI_CLI_FLAGS[family], prompt]
+    # user args from `-- ...` go after the built-in flags, before the prompt
+    return [
+        "bash",
+        "-c",
+        '"$0" "$@"',
+        ai_cli,
+        *AI_CLI_FLAGS[family],
+        *ai_cli_args,
+        prompt,
+    ]
 
 
 # Matched against the tail of a failed agent run only (see get_is_usage_limit).
@@ -120,3 +129,4 @@ class RunConfig:
     pr_timeout_min: int = 30
     cooldown_min: int = 30
     dry_run: bool = False
+    ai_cli_args: list = field(default_factory=list)
