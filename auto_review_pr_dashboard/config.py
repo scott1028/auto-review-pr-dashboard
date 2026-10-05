@@ -62,13 +62,11 @@ def get_scoped_prompt(prompt, repo, url):
 
 
 def get_ai_command(ai_cli, prompt, repo, url, ai_cli_args=()):
-    """Full argv for reviewing one PR, run through bash.
+    """Full argv for reviewing one PR, run through interactive bash.
 
-    Most of these CLIs are bash functions from `~/.bashrc.d/*`, not binaries -
-    `codex-personal` for instance only exists as a function that sets CODEX_HOME.
-    execvp cannot see those, so the command goes through `bash -c '"$0" "$@"'`:
-    `"$0"` is an ordinary command word, so bash resolves functions exported by
-    the launcher (`export -f`) before falling back to PATH.
+    Some CLIs are bash functions from `~/.bashrc.d/*`, not binaries.
+    `bash -ic` loads `~/.bashrc`, then resolves `"$0"` as a function or PATH
+    command. A startup definition can replace a function exported by the launcher.
     """
     scoped_prompt = get_scoped_prompt(prompt, repo, url)
     return get_agent_command(ai_cli, scoped_prompt, ai_cli_args)
@@ -79,7 +77,7 @@ def get_agent_command(ai_cli, prompt, ai_cli_args):
     # user args from `-- ...` go after the built-in flags, before the prompt
     return [
         "bash",
-        "-c",
+        "-ic",
         '"$0" "$@"',
         ai_cli,
         *AI_CLI_FLAGS[family],

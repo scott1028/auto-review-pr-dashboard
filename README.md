@@ -12,13 +12,13 @@ make install
 
 `uv tool install .` puts an `auto-review-pr-dashboard` executable on `PATH`, and a
 symlink at `~/.bashrc.d/auto-review-pr-dashboard` defines a shell function of the same
-name. Both are needed; open a new shell afterwards.
+name. The wrapper exports the selected AI function; open a new shell afterwards.
 
-The function is not a convenience: most `ai_cli` names (`codex-personal`, even plain
-`codex`) are **bash functions** from `~/.bashrc.d`, not binaries, and only the calling
-interactive shell can `export -f` them. It exports the named function as
-`BASH_FUNC_<name>%%` before handing off, so the agent — spawned as
-`bash -c '"$0" "$@"' <ai_cli> ...` — still resolves it, and stays exported afterwards.
+The wrapper passes a function through `BASH_FUNC_<name>%%`. Each PR runs in
+`bash -ic`, which loads `~/.bashrc` before invoking `ai_cli`. Functions and helpers
+defined there are available even if the wrapper was bypassed. If `~/.bashrc`
+defines the same function, its definition replaces the exported one. Shell startup
+output is captured in the PR log.
 
 | Target | Action |
 |---|---|
@@ -197,4 +197,4 @@ make test                               # 92 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
 
-`tests/test_config_parity.py` asserts a bash-function `ai_cli` really runs via `bash -c`.
+`tests/test_config_parity.py` asserts a bash-function `ai_cli` really runs via `bash -ic`.

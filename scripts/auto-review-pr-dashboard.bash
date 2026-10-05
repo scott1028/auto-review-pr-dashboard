@@ -1,11 +1,8 @@
 # Sourced from ~/.bashrc.d/auto-review-pr-dashboard (a symlink to this file).
 #
-# The shell function exists for one reason: to export a bash-function ai_cli
-# before the real CLI starts. Most ai_cli names here (codex-personal sets
-# CODEX_HOME, claude-personal, ...) are bash functions from this same
-# ~/.bashrc.d, not binaries. Exporting one puts it in the environment as
-# BASH_FUNC_<name>%%, so the `bash -c` the python side spawns can still resolve
-# it. Real binaries need nothing.
+# Export the selected ai_cli function as BASH_FUNC_<name>%% for child processes.
+# Agent shells use `bash -ic`, so ~/.bashrc may define helpers or replace it.
+# PATH binaries need no export.
 #
 # The CLI itself is installed separately by `make install` (uv tool install).
 

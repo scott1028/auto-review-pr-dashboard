@@ -83,7 +83,7 @@ class ConfigParityTest(unittest.TestCase):
         command = get_ai_command(
             "codex-personal", "review", "owner/repo", "https://x/pull/7"
         )
-        self.assertEqual(command[:4], ["bash", "-c", '"$0" "$@"', "codex-personal"])
+        self.assertEqual(command[:4], ["bash", "-ic", '"$0" "$@"', "codex-personal"])
         self.assertEqual(command[4:-1], AI_CLI_FLAGS["codex"])
         command = get_ai_command(
             "codex", "review", "owner/repo", "https://x/pull/7", ai_cli_args=["--yolo"]
