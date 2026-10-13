@@ -14,11 +14,10 @@ make install
 symlink at `~/.bashrc.d/auto-review-pr-dashboard` defines a shell function of the same
 name. The wrapper exports the selected AI function; open a new shell afterwards.
 
-The wrapper passes a function through `BASH_FUNC_<name>%%`. Each PR runs in
-`bash -ic`, which loads `~/.bashrc` before invoking `ai_cli`. Functions and helpers
-defined there are available even if the wrapper was bypassed. If `~/.bashrc`
-defines the same function, its definition replaces the exported one. Shell startup
-output is captured in the PR log.
+The wrapper passes a function through `BASH_FUNC_<name>%%`. Each PR runs in `bash -ic`,
+which loads `~/.bashrc` before invoking `ai_cli`, so functions defined there are available
+even if the wrapper was bypassed — unless `~/.bashrc` defines the same name, which
+replaces the exported one. Shell startup output is captured in the PR log.
 
 | Target | Action |
 |---|---|
@@ -57,14 +56,14 @@ auto-review-pr-dashboard claude --pr-url https://github.com/owner/repo/pull/<n>
 auto-review-pr-dashboard codex --pr-url https://github.com/owner/repo/pull/<n> -- --yolo
 ```
 
-The prompt says *how* to review, the flags say *which* PRs — scope is never inferred
-from prompt text, and anything unsearchable ("PRs labelled X") belongs in the prompt.
-`--repo-url` accepts `owner/repo` or any git url, a PR url is rejected with a pointer
-to `--pr-url`, and inline env vars reach `gh` and the agent. A normal launch starts a
+The prompt says *how* to review, the flags say *which* PRs — scope is never inferred from
+prompt text, and anything unsearchable ("PRs labelled X") belongs in the prompt.
+`--repo-url` accepts `owner/repo` or any git url, a PR url is rejected with a pointer to
+`--pr-url`, and inline env vars reach `gh` and the agent. A normal launch starts a
 detached daemon for the caller's working directory and attaches to it (see
 [Architecture](#architecture-tui--ipc--service)); `--resume` reattaches from that same
-directory, must be used alone, and replaces any previous dashboard, while a crashed
-daemon is reported, not restarted. `--dry-run` stays foreground-only.
+directory, must be used alone, and replaces any previous dashboard, while a crashed daemon
+is reported, not restarted. `--dry-run` stays foreground-only.
 
 ### Prompt selection
 
@@ -94,7 +93,7 @@ persists it, so later edits — and `--resume` — never change that run.
 | `l` | anywhere | show / hide the live agent log panel |
 | `d` | anywhere | background the run — detach and close the dashboard, daemon keeps going |
 | `f` / `esc` | detail | toggle log follow / back to the list |
-| `q` | anywhere | stop the daemon (including the running agent) and quit — asks first while a PR runs, `No` preselected |
+| `q` | anywhere | stop the daemon (its agent gets SIGTERM, then SIGKILL after `TERMINATE_GRACE_SEC` — 5s, in `runner.py`) and quit — asks first while a PR runs, `No` preselected |
 
 ## Architecture: TUI → IPC → Service
 
@@ -113,26 +112,26 @@ persists it, so later edits — and `--resume` — never change that run.
 
 Why the extra hop, instead of running the loop inside the TUI:
 
-- **A review outlives its terminal.** One PR can take 30 minutes and a loop runs for
-  hours; as a child of the terminal, the agent dies with a closed tab or a lost SSH
-  session. The daemon is spawned with `start_new_session`, so `d`, a closed window and
-  a dropped connection all leave the work running.
+- **A review outlives its terminal.** A PR can take 30 minutes, a loop hours; as a child
+  of the terminal the agent dies with a closed tab or lost SSH session. The daemon is
+  spawned with `start_new_session`, so `d` and a closed window keep the work running.
 - **A half-finished review is not free.** An agent killed mid-run may already have
-  posted inline comments but not its head marker, so the next loop re-reviews that SHA.
-  Process lifetime belongs to whatever owns the queue, not to whatever draws it.
+  posted inline comments but not its head marker, so the next loop re-reviews that SHA —
+  the detail screen says so. Process lifetime belongs to whatever owns the queue.
 - **The service must not know about the UI.** `LoopRunner` only pushes events into an
-  `on_event` callback — which is what lets the same class run under the daemon and
-  in-process for tests, driven by a mock AI CLI with no terminal attached.
-- **The socket is the contract, so the TUI stays stateless.** Every attach starts with
-  a full snapshot, the daemon pushes a new one on each state change, and a keypress is
-  a `command` message, not a call into the runner — a reattached dashboard renders the
-  last snapshot instead of holding the truth. Backpressure is daemon-side too: ticks
-  send no snapshot, and a client buffering past 1 MiB is dropped.
+  `on_event` callback, so one class runs under the daemon and in-process for a mock CLI.
+- **The socket is the contract, so the TUI stays stateless.** Every attach starts with a
+  full snapshot, the daemon pushes one on each state change, and a keypress is a `command`
+  message, not a call into the runner. Backpressure is daemon-side too: ticks send no
+  snapshot, and a client buffering past 1 MiB is dropped.
 - **One daemon per working directory, on a unix socket** at
   `/tmp/auto-review-pr-dashboard-<uid>/<cwd-hash>.sock` (mode `0700`, a sibling `.lock`
   serialising startup) — local only, no port, no auth to get wrong, though the handshake
   still checks protocol version, run id, and cwd. Artifacts and the daemon share one
   scope, so a second launch in that directory is refused, not interleaved.
+- **A long run renews itself.** `run_forever` returns on a recycle, the daemon takes that
+  `.lock`, wipes `.tmp/`, and hands the loop state to its successor on stdin; the TUI
+  waits for the new `run_id` in `daemon.json` and reattaches without losing the screen.
 
 ## What it does per loop
 
@@ -151,15 +150,14 @@ Why the extra hop, instead of running the loop inside the TUI:
 
 ## When the agent hits its usage limit
 
-Detection needs a **failed** run, so a normal review cannot trip it: the failed
-output's tail matches a quota pattern (`usage limit`, `429`, `quota`, ...), or two
-failures land in a row whatever the wording — which also catches lost auth, a broken
-CLI, or a dead network. The PR then returns to the **front** of the queue as `queued`
-and the loop suspends for `--cooldown` minutes behind a banner `n` can skip, so the
-rest of the queue is not burned seconds after the first failure. A run that had already
-posted comments is marked `failed` instead, since a rerun could duplicate them; after 3
-cooldowns the loop gives up and waits for `--interval`. Every failure records the
-agent's last output in the PR's `error` field.
+Detection needs a **failed** run, so a normal review cannot trip it: the failed output's
+tail matches a quota pattern (`usage limit`, `429`, `quota`, ...), or two failures land in
+a row whatever the wording — which also catches lost auth, a broken CLI, dead network.
+The PR then returns to the **front** of the queue as `queued` and the loop suspends for
+`--cooldown` minutes behind a banner `n` can skip, so the rest of the queue is not burned
+seconds after the first failure. A run that had already posted comments is marked `failed`
+instead, since a rerun could duplicate them; after 3 cooldowns the loop gives up and waits
+for `--interval`. Every failure records the agent's last output in the PR's `error` field.
 
 ## Artifacts
 
@@ -174,14 +172,16 @@ Written under the **caller's** working directory (usually the multi-repo parent 
 └── logs/loop-0003/owner__repo__7.log
 ```
 
-`loops/*.json` is kept forever; `logs/` keeps the **10 newest loop dirs** — 10 loops,
-not 10 hours. `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
+Every `RECYCLE_EVERY_LOOPS` loops (10, in `session.py`) the whole `.tmp/` is deleted —
+other tools' files included — so `loops/` and `daemon.log` stay bounded; the status line
+counts those cleanups as `cleaned N×`. Between them `logs/` keeps the **10 newest loop
+dirs** (10 loops, not 10 hours); `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
 
 ## Caveats
 
-- Cancelling mid-review can leave inline comments posted with no summary marker, so the
-  next loop reviews that SHA again; the detail screen says so. A daemon crash is not
-  recovered automatically for the same reason — a restart could repeat posted comments.
+- A daemon that dies without cleaning up leaves its agent running; the next start kills
+  that process group from `agent_pgid` in `daemon.json`, and leaves it alone if the pid
+  has since been reused. A descendant that called `setsid` itself is out of reach.
 - `-l` reads `/proc`: Linux-only and current user only. Concurrency is fixed at one PR
   at a time, and a TTY is required.
 - The log panels are memory-bounded, not a faithful copy of the `.log`: lines past 2000
@@ -193,7 +193,7 @@ not 10 hours. `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
 ## Tests
 
 ```bash
-make test                               # 92 tests, no network
+make test                               # 125 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
 

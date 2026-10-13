@@ -50,10 +50,18 @@ class AgentRun:
 
 
 class LoopRunner:
-    def __init__(self, config: RunConfig, store: Store, on_event=None):
+    def __init__(
+        self,
+        config: RunConfig,
+        store: Store,
+        on_event=None,
+        recycle_every_loops: int | None = None,
+    ):
         self.config = config
         self.store = store
         self.on_event = on_event or (lambda *args: None)
+        # None = never recycle, which is what the in-process dashboard does.
+        self.recycle_every_loops = recycle_every_loops
 
         self.loop_index = 0
         self.record: LoopRecord | None = None
@@ -63,12 +71,17 @@ class LoopRunner:
         self.blocked_until: float | None = None
         self.block_reason = ""
         self.consecutive_failures = 0
+        self.is_recycle_requested = False
 
         self._stopped = False
         self._run_now = False
         self._current_key: str | None = None
         self._current_process: asyncio.subprocess.Process | None = None
         self._cancelled_keys: set[str] = set()
+        # The one escalation task per process, kept referenced so it is not
+        # garbage-collected before it runs.
+        self._stop_task: asyncio.Task | None = None
+        self._stop_task_process: asyncio.subprocess.Process | None = None
 
     # ---- events -------------------------------------------------------------
 
@@ -81,7 +94,8 @@ class LoopRunner:
         self._stopped = True
         self._run_now = True
         if self._current_process is not None:
-            self._terminate(self._current_process, signal.SIGTERM)
+            # Escalates like cancel() does: SIGTERM, then SIGKILL after the grace.
+            self._schedule_stop(self._current_process)
 
     def run_now(self) -> None:
         """Skip whatever countdown is running - idle between loops, or a cooldown."""
@@ -109,9 +123,7 @@ class LoopRunner:
             item.error = "cancel requested"
             self.emit("item_update", item)
             # SIGTERM now, SIGKILL after the grace period if it ignores us.
-            asyncio.get_running_loop().create_task(
-                self._stop_process(self._current_process)
-            )
+            self._schedule_stop(self._current_process)
         return True
 
     def resume(self, key: str) -> bool:
@@ -135,20 +147,46 @@ class LoopRunner:
     def _remove_from_queue(self, key: str) -> None:
         self.queue = deque(queued for queued in self.queue if queued != key)
 
+    def _schedule_stop(self, process) -> None:
+        """Escalate one process at most once, however many paths ask for it."""
+        if self._stop_task_process is process:
+            return
+        self._stop_task_process = process
+        # Keep the task on self: a bare create_task can be garbage-collected
+        # before it ever runs.
+        self._stop_task = asyncio.get_running_loop().create_task(
+            self._stop_process(process)
+        )
+
     # ---- main loop ----------------------------------------------------------
 
     async def run_forever(self) -> None:
         while not self._stopped:
+            # A recycled daemon is handed a countdown already running: honour it
+            # instead of starting a fresh interval.
+            if self.next_run_at is not None:
+                await self._idle_until_next_loop()
+                if self._stopped:
+                    break
             await self.run_loop()
             if self._stopped:
                 break
+            if (
+                self.recycle_every_loops is not None
+                and self.loop_index % self.recycle_every_loops == 0
+            ):
+                # The daemon restarts itself here: a fresh process, and a clean
+                # .tmp/ for the loops ahead. Idle would be the next step instead.
+                self.is_recycle_requested = True
+                return
             if self.blocked_until is not None:
                 await self._wait_while_blocked()
             else:
                 await self._idle_until_next_loop()
 
     async def _idle_until_next_loop(self) -> None:
-        self.next_run_at = time.time() + self.config.interval_min * 60
+        if self.next_run_at is None:
+            self.next_run_at = time.time() + self.config.interval_min * 60
         self.emit("idle_start", self.next_run_at)
         while not self._run_now and not self._stopped:
             await asyncio.sleep(1)
@@ -298,6 +336,7 @@ class LoopRunner:
         error = ""
         exit_code = None
         timed_out = False
+        is_spawned = False
 
         # Opened before the spawn, so a log that cannot be written is reported as
         # itself instead of being blamed on the agent binary.
@@ -318,6 +357,9 @@ class LoopRunner:
                     start_new_session=True,
                 )
                 self._current_process = process
+                is_spawned = True
+                # The daemon records the group so a crash cannot orphan this agent.
+                self.emit("agent_started", process.pid)
                 try:
                     await asyncio.wait_for(
                         self._pump_output(process, log_key, log_file, output_tail),
@@ -344,6 +386,8 @@ class LoopRunner:
             exit_code = 1
         finally:
             self._current_process = None
+            if is_spawned:
+                self.emit("agent_finished")
 
         return AgentRun(
             exit_code=exit_code,

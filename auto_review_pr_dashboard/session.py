@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -18,10 +19,12 @@ import uuid
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
+from io import TextIOWrapper
 from pathlib import Path
 
 from .config import RunConfig
-from .runner import LoopRunner
+from .models import LoopRecord
+from .runner import TERMINATE_GRACE_SEC, LoopRunner
 from .store import DEFAULT_BASE_DIR, Store
 
 PROTOCOL_VERSION = 1
@@ -31,6 +34,9 @@ DAEMON_MODULE = "auto_review_pr_dashboard.session"
 PROC_DIR = Path("/proc")
 DAEMON_LOG_FILE_NAME = "daemon.log"
 MAX_CLIENT_BUFFER_BYTES = 1024 * 1024
+# Every Nth loop the daemon restarts itself and wipes .tmp/, which is what keeps
+# loops/*.json and daemon.log bounded without a retention mechanism of its own.
+RECYCLE_EVERY_LOOPS = 10
 
 
 class SessionError(RuntimeError):
@@ -46,6 +52,10 @@ class RuntimeMetadata:
     socket_path: str
     started_at: float
     config: dict
+    # The agent group a running daemon owns, so the next start can kill what a
+    # crash left behind. Absent from a daemon.json written before this existed.
+    agent_pgid: int | None = None
+    agent_start_ticks: int | None = None
 
     @classmethod
     def from_dict(cls, payload: dict) -> RuntimeMetadata:
@@ -58,6 +68,16 @@ class RuntimeMetadata:
                 socket_path=str(payload["socket_path"]),
                 started_at=float(payload["started_at"]),
                 config=dict(payload["config"]),
+                agent_pgid=(
+                    None
+                    if payload.get("agent_pgid") is None
+                    else int(payload["agent_pgid"])
+                ),
+                agent_start_ticks=(
+                    None
+                    if payload.get("agent_start_ticks") is None
+                    else int(payload["agent_start_ticks"])
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise SessionError("invalid runtime metadata") from error
@@ -161,90 +181,163 @@ def get_live_workspaces() -> list[RuntimeMetadata]:
     return sorted(workspaces, key=lambda metadata: metadata.started_at)
 
 
-def start_daemon(config: RunConfig, store: Store) -> RuntimeMetadata:
+def start_daemon(
+    config: RunConfig, store: Store, handoff: dict | None = None
+) -> RuntimeMetadata:
     """Start one detached daemon for the caller's working directory."""
-    cwd = Path.cwd().resolve()
-    base_dir = store.base_dir.resolve()
-    socket_path = get_socket_path(cwd)
+    socket_path = get_socket_path(Path.cwd().resolve())
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(socket_path.parent, 0o700)
-    store.prepare()
 
     lock_path = socket_path.with_suffix(".lock")
     with lock_path.open("a", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
-        if _get_is_socket_live(socket_path):
-            raise SessionError(
-                "a daemon is already running in this working directory; "
-                "use auto-review-pr-dashboard --resume"
-            )
+        return _start_daemon_locked(config, store, handoff)
 
-        socket_path.unlink(missing_ok=True)
-        get_runtime_path(store).unlink(missing_ok=True)
-        payload = json.dumps(
-            {
-                "config": asdict(config),
-                "base_dir": str(base_dir),
-                "cwd": str(cwd),
-                "socket_path": str(socket_path),
-                "run_id": uuid.uuid4().hex,
-            },
-            ensure_ascii=False,
-        )
-        log_path = store.base_dir / DAEMON_LOG_FILE_NAME
-        child_env = os.environ.copy()
-        package_root = str(Path(__file__).resolve().parents[1])
-        existing_python_path = child_env.get("PYTHONPATH")
-        child_env["PYTHONPATH"] = (
-            f"{package_root}{os.pathsep}{existing_python_path}"
-            if existing_python_path
-            else package_root
-        )
-        with log_path.open("ab") as daemon_log:
-            try:
-                process = subprocess.Popen(
-                    [sys.executable, "-m", DAEMON_MODULE],
-                    cwd=cwd,
-                    stdin=subprocess.PIPE,
-                    stdout=daemon_log,
-                    stderr=subprocess.STDOUT,
-                    env=child_env,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-                # The payload goes on stdin: argv is readable by other processes.
-                # suppress has to cover write and close alike - close() flushes
-                # whatever is still buffered, and that write can hit a dead pipe.
-                with suppress(BrokenPipeError), process.stdin:
-                    process.stdin.write(payload.encode("utf-8"))
-                threading.Thread(
-                    target=process.wait,
-                    name="auto-review-pr-dashboard-daemon-wait",
-                    daemon=True,
-                ).start()
-            except OSError as error:
-                raise SessionError(
-                    f"cannot start background daemon: {error}"
-                ) from error
 
-        deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                detail = _get_log_tail(log_path)
-                suffix = f": {detail}" if detail else ""
-                raise SessionError(
-                    f"background daemon exited with {process.returncode}{suffix}"
-                )
-            metadata = load_runtime_metadata(store)
-            if metadata is not None and _get_is_socket_live(socket_path):
-                return metadata
-            time.sleep(0.05)
+def _start_daemon_locked(
+    config: RunConfig, store: Store, handoff: dict | None
+) -> RuntimeMetadata:
+    """Start the daemon; the caller already holds this working directory's lock.
 
-        process.terminate()
+    A recycling daemon holds that lock and calls this directly: flock is per file
+    descriptor, so taking it again in the same process would deadlock.
+    """
+    cwd = Path.cwd().resolve()
+    base_dir = store.base_dir.resolve()
+    socket_path = get_socket_path(cwd)
+    store.prepare()
+
+    if _get_is_socket_live(socket_path):
         raise SessionError(
-            f"background daemon did not become ready within {STARTUP_TIMEOUT_SEC}s; "
-            f"see {log_path}"
+            "a daemon is already running in this working directory; "
+            "use auto-review-pr-dashboard --resume"
         )
+
+    # Nothing cleans up after a SIGKILL, an OOM or a crash: the agent outlives the
+    # daemon in its own session, and its pid is only in the leftover daemon.json.
+    leftover = load_runtime_metadata(store)
+    if leftover is not None:
+        _kill_orphan_agent(leftover)
+
+    socket_path.unlink(missing_ok=True)
+    get_runtime_path(store).unlink(missing_ok=True)
+    payload = json.dumps(
+        {
+            "config": asdict(config),
+            "base_dir": str(base_dir),
+            "cwd": str(cwd),
+            "socket_path": str(socket_path),
+            "run_id": uuid.uuid4().hex,
+            "handoff": handoff,
+        },
+        ensure_ascii=False,
+    )
+    log_path = store.base_dir / DAEMON_LOG_FILE_NAME
+    child_env = os.environ.copy()
+    package_root = str(Path(__file__).resolve().parents[1])
+    existing_python_path = child_env.get("PYTHONPATH")
+    child_env["PYTHONPATH"] = (
+        f"{package_root}{os.pathsep}{existing_python_path}"
+        if existing_python_path
+        else package_root
+    )
+    with log_path.open("ab") as daemon_log:
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-m", DAEMON_MODULE],
+                cwd=cwd,
+                stdin=subprocess.PIPE,
+                stdout=daemon_log,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                start_new_session=True,
+                close_fds=True,
+            )
+            # The payload goes on stdin: argv is readable by other processes.
+            # suppress has to cover write and close alike - close() flushes
+            # whatever is still buffered, and that write can hit a dead pipe.
+            with suppress(BrokenPipeError), process.stdin:
+                process.stdin.write(payload.encode("utf-8"))
+            threading.Thread(
+                target=process.wait,
+                name="auto-review-pr-dashboard-daemon-wait",
+                daemon=True,
+            ).start()
+        except OSError as error:
+            raise SessionError(f"cannot start background daemon: {error}") from error
+
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            detail = _get_log_tail(log_path)
+            suffix = f": {detail}" if detail else ""
+            raise SessionError(
+                f"background daemon exited with {process.returncode}{suffix}"
+            )
+        metadata = load_runtime_metadata(store)
+        if metadata is not None and _get_is_socket_live(socket_path):
+            return metadata
+        time.sleep(0.05)
+
+    process.terminate()
+    raise SessionError(
+        f"background daemon did not become ready within {STARTUP_TIMEOUT_SEC}s; "
+        f"see {log_path}"
+    )
+
+
+def get_process_start_ticks(pid: int) -> int | None:
+    """The pid's starttime in clock ticks, which never survives a pid being reused."""
+    try:
+        stat = (PROC_DIR / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # comm is parenthesised and may hold spaces and ')', so the fixed fields are
+    # counted back from the last ')' rather than forward from the first.
+    fields = stat.rsplit(")", 1)[1].split()
+    try:
+        return int(fields[19])
+    except IndexError:
+        return None
+
+
+def _kill_orphan_agent(metadata: RuntimeMetadata) -> None:
+    """Kill the agent group a dead daemon left running, if it is still the same one."""
+    if metadata.agent_pgid is None:
+        return
+    pgid = metadata.agent_pgid
+    # A pid can be handed to a new process: the recorded starttime says whether this
+    # group is still the one we knew. A group whose leader is gone keeps its pgid
+    # while any member lives, so a missing starttime match is not a reason to skip.
+    if metadata.agent_start_ticks is not None:
+        start_ticks = get_process_start_ticks(pgid)
+        if start_ticks is not None and start_ticks != metadata.agent_start_ticks:
+            return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + TERMINATE_GRACE_SEC
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+        time.sleep(0.05)
+    with suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+def _take_start_lock(socket_path: Path) -> TextIOWrapper:
+    """Take this working directory's startup lock and hand back the open file.
+
+    Runs off the event loop: the lock can be held by a launch that is still
+    starting a daemon. The caller keeps the file referenced until it exits.
+    """
+    lock_file = socket_path.with_suffix(".lock").open("a", encoding="utf-8")
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    return lock_file
 
 
 def _get_is_socket_live(socket_path: Path) -> bool:
@@ -359,6 +452,7 @@ class SessionServer:
         cwd: str,
         socket_path: Path,
         run_id: str,
+        handoff: dict | None = None,
     ):
         self.config = config
         self.store = store
@@ -366,12 +460,31 @@ class SessionServer:
         self.socket_path = socket_path
         self.run_id = run_id
         self.started_at = time.time()
-        self.runner = LoopRunner(config, store, on_event=self.emit_runner_event)
+        self.runner = LoopRunner(
+            config,
+            store,
+            on_event=self.emit_runner_event,
+            recycle_every_loops=RECYCLE_EVERY_LOOPS,
+        )
         self.status = "starting"
         self.phase_started_at = self.started_at
+        self.recycle_count = 0
+        self.agent_pgid: int | None = None
+        self.agent_start_ticks: int | None = None
+        if handoff is not None:
+            # The loop counter, the countdown and the table carry over from the
+            # daemon this one replaces, so the dashboard shows no gap.
+            self.runner.loop_index = int(handoff["loop_index"])
+            self.runner.paused = bool(handoff["paused"])
+            self.runner.next_run_at = handoff["next_run_at"]
+            self.recycle_count = int(handoff["recycle_count"])
+            if handoff["record"] is not None:
+                self.runner.record = LoopRecord.from_dict(handoff["record"])
+                self.status = f"Loop #{self.runner.loop_index} · finished"
         self._event_loop: asyncio.AbstractEventLoop | None = None
         self._server: asyncio.Server | None = None
         self._client_writer: asyncio.StreamWriter | None = None
+        self._start_lock: TextIOWrapper | None = None
 
     async def run(self) -> None:
         self._event_loop = asyncio.get_running_loop()
@@ -384,7 +497,10 @@ class SessionServer:
         try:
             await self.runner.run_forever()
         finally:
-            await self._shutdown()
+            if self.runner.is_recycle_requested:
+                await self._recycle()
+            else:
+                await self._shutdown()
 
     def _install_signal_handlers(self) -> None:
         event_loop = asyncio.get_running_loop()
@@ -401,6 +517,8 @@ class SessionServer:
             socket_path=str(self.socket_path),
             started_at=self.started_at,
             config=asdict(self.config),
+            agent_pgid=self.agent_pgid,
+            agent_start_ticks=self.agent_start_ticks,
         )
         runtime_path = get_runtime_path(self.store)
         temporary_path = runtime_path.with_suffix(".tmp")
@@ -418,6 +536,19 @@ class SessionServer:
     def _handle_runner_event(self, name: str, payload: tuple) -> None:
         if name == "log":
             self._send_to_client({"type": "log", "key": payload[0], "line": payload[1]})
+            return
+
+        # Recorded in daemon.json only: the dashboard has no use for a pid, and
+        # start_new_session makes the agent its own group leader, so pid is pgid.
+        if name == "agent_started":
+            self.agent_pgid = payload[0]
+            self.agent_start_ticks = get_process_start_ticks(payload[0])
+            self._write_runtime_metadata()
+            return
+        if name == "agent_finished":
+            self.agent_pgid = None
+            self.agent_start_ticks = None
+            self._write_runtime_metadata()
             return
 
         if name == "loop_start":
@@ -466,6 +597,7 @@ class SessionServer:
             "block_reason": self.runner.block_reason,
             "current_key": self.runner._current_key,
             "phase_started_at": self.phase_started_at,
+            "recycle_count": self.recycle_count,
         }
 
     def _send_snapshot(self) -> None:
@@ -574,6 +706,65 @@ class SessionServer:
             {"type": "notice", "message": message, "severity": severity}
         )
 
+    async def _recycle(self) -> None:
+        """Hand the loop to a fresh daemon, wiping `.tmp/` on the way."""
+        self._send_to_client(
+            {
+                "type": "recycling",
+                "message": "daemon restarting to clear .tmp/ after "
+                f"{RECYCLE_EVERY_LOOPS} loops",
+            }
+        )
+        try:
+            try:
+                # Held until this process exits: releasing it before the successor
+                # binds its socket would let another launch race it.
+                self._start_lock = await asyncio.to_thread(
+                    _take_start_lock, self.socket_path
+                )
+            finally:
+                # Runs exactly once on every path: a recycle that failed before or
+                # during the shutdown must still leave no stale socket or
+                # daemon.json behind, and after a successful spawn a second
+                # shutdown would delete the successor's socket.
+                await self._shutdown()
+
+            # Every child of the caller's `.tmp/`, other tools' files included -
+            # the agreed scope. The name guard keeps a custom base_dir from
+            # deleting more.
+            tmp_dir = self.store.base_dir.parent
+            if tmp_dir.name == ".tmp":
+                for child in tmp_dir.iterdir():
+                    try:
+                        if child.is_dir() and not child.is_symlink():
+                            shutil.rmtree(child, ignore_errors=True)
+                        else:
+                            child.unlink(missing_ok=True)
+                    except OSError:
+                        continue
+
+            handoff = {
+                "loop_index": self.runner.loop_index,
+                "next_run_at": time.time() + self.config.interval_min * 60,
+                "paused": self.runner.paused,
+                "record": None
+                if self.runner.record is None
+                else self.runner.record.to_dict(),
+                "recycle_count": self.recycle_count + 1,
+            }
+            _start_daemon_locked(self.config, self.store, handoff=handoff)
+        except Exception as error:
+            # Any recycle failure, not just SessionError. This process' own stdout
+            # is a deleted file by now, so the successor's log is the only place
+            # the reason can still be read.
+            try:
+                log_path = self.store.base_dir / DAEMON_LOG_FILE_NAME
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as daemon_log:
+                    daemon_log.write(f"recycle failed: {error}\n")
+            except OSError:
+                pass
+
     async def _shutdown(self) -> None:
         if self._client_writer is not None:
             self._client_writer.close()
@@ -609,6 +800,7 @@ def _run_daemon(payload_text: str) -> int:
         payload["cwd"],
         Path(payload["socket_path"]),
         payload["run_id"],
+        handoff=payload.get("handoff"),
     )
     asyncio.run(server.run())
     return 0

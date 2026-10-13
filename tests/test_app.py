@@ -1,8 +1,10 @@
 import json
+import os
 import sys
 import tempfile
 import time
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +13,7 @@ from textual.widgets import Footer, RichLog, Static
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from auto_review_pr_dashboard import app as app_module
 from auto_review_pr_dashboard import runner as runner_module
 from auto_review_pr_dashboard.app import (
     MAX_BUFFERED_LOG_LINES,
@@ -29,6 +32,11 @@ from auto_review_pr_dashboard.models import (
     PrState,
     SkipReason,
     Verdict,
+)
+from auto_review_pr_dashboard.session import (
+    PROTOCOL_VERSION,
+    RuntimeMetadata,
+    get_socket_path,
 )
 from auto_review_pr_dashboard.store import Store
 
@@ -50,6 +58,20 @@ async def noop_forever(_runner):
     return None
 
 
+def make_metadata(run_id: str) -> RuntimeMetadata:
+    """Daemon metadata a fake session can claim it was attached to."""
+    cwd = str(Path.cwd().resolve())
+    return RuntimeMetadata(
+        protocol_version=PROTOCOL_VERSION,
+        run_id=run_id,
+        pid=os.getpid(),
+        cwd=cwd,
+        socket_path=str(get_socket_path(cwd)),
+        started_at=time.time(),
+        config=asdict(RunConfig("codex-personal", "review")),
+    )
+
+
 class FakeRunner:
     def __init__(self):
         self.stopped = False
@@ -59,9 +81,10 @@ class FakeRunner:
 
 
 class FakeSession:
-    def __init__(self, config, record=None):
+    def __init__(self, config, record=None, run_id="run-1"):
         self.commands = []
         self.is_disconnected = False
+        self.metadata = make_metadata(run_id)
         self.snapshot = {
             "type": "snapshot",
             "config": config.__dict__,
@@ -399,6 +422,143 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
             app.handle_session_message(next_snapshot)
 
             self.assertEqual(app._log_buffer, {})
+
+    async def test_recycling_reattaches_to_the_new_daemon_without_exiting(self):
+        app = AutoReviewPrDashboardApp(
+            self.config,
+            store=Store(Path(self.tmp.name)),
+            session=FakeSession(self.config, run_id="old-run"),
+        )
+        new_session = FakeSession(self.config, run_id="new-run")
+        with (
+            patch.object(
+                app_module,
+                "load_runtime_metadata",
+                return_value=make_metadata("new-run"),
+            ),
+            patch.object(app_module, "get_resume_error", return_value=""),
+            patch.object(app_module, "SessionClient", return_value=new_session),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.handle_session_message(
+                    {"type": "recycling", "message": "daemon restarting"}
+                )
+                await pilot.pause()
+                self.assertTrue(app.is_recycling)
+
+                # The old daemon closing its socket is part of the handoff.
+                app.handle_session_message(
+                    {"type": "disconnected", "message": "connection closed"}
+                )
+                await pilot.pause()
+                self.assertIs(app.session, new_session)
+                self.assertFalse(app.is_recycling)
+
+        self.assertIsNone(app.return_value)
+
+    async def test_a_fatal_error_mid_recycle_lets_reattach_have_the_say(self):
+        app = AutoReviewPrDashboardApp(
+            self.config,
+            store=Store(Path(self.tmp.name)),
+            session=FakeSession(self.config, run_id="old-run"),
+        )
+        new_session = FakeSession(self.config, run_id="new-run")
+        with (
+            patch.object(
+                app_module,
+                "load_runtime_metadata",
+                return_value=make_metadata("new-run"),
+            ),
+            patch.object(app_module, "get_resume_error", return_value=""),
+            patch.object(app_module, "SessionClient", return_value=new_session),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.handle_session_message(
+                    {"type": "recycling", "message": "daemon restarting"}
+                )
+                # A keypress in flight when the old daemon closes its socket
+                # surfaces as ECONNRESET ahead of the "disconnected" message.
+                app.handle_session_message(
+                    {
+                        "type": "error",
+                        "message": "[Errno 104] Connection reset by peer",
+                        "fatal": True,
+                    }
+                )
+                await pilot.pause()
+                self.assertIsNone(app.return_value)
+
+                app.handle_session_message(
+                    {"type": "disconnected", "message": "connection closed"}
+                )
+                await pilot.pause()
+                self.assertIs(app.session, new_session)
+
+        self.assertIsNone(app.return_value)
+
+    async def test_disconnected_without_recycling_still_exits(self):
+        app = AutoReviewPrDashboardApp(
+            self.config,
+            store=Store(Path(self.tmp.name)),
+            session=FakeSession(self.config),
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.handle_session_message(
+                {"type": "disconnected", "message": "connection closed"}
+            )
+            await pilot.pause()
+
+        self.assertEqual(app.return_value, "disconnected")
+
+    async def test_reattach_gives_up_when_no_new_daemon_becomes_attachable(self):
+        app = AutoReviewPrDashboardApp(
+            self.config,
+            store=Store(Path(self.tmp.name)),
+            session=FakeSession(self.config),
+        )
+
+        with (
+            patch.object(app_module, "load_runtime_metadata", return_value=None),
+            patch.object(app_module, "RECYCLE_REATTACH_TIMEOUT_SEC", 0.3),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.handle_session_message(
+                    {"type": "recycling", "message": "daemon restarting"}
+                )
+                app.handle_session_message(
+                    {"type": "disconnected", "message": "connection closed"}
+                )
+                await pilot.pause(0.6)
+
+        self.assertEqual(app.return_value, "disconnected")
+
+    async def test_status_line_counts_the_cleanups_the_daemon_has_done(self):
+        session = FakeSession(self.config)
+        app = AutoReviewPrDashboardApp(
+            self.config, store=Store(Path(self.tmp.name)), session=session
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            self.assertIn("cleaned 0×", str(app.query_one(Dashboard).content))
+
+            app.handle_session_message(session.snapshot | {"recycle_count": 2})
+            await pilot.pause()
+            rendered = str(app.query_one(Dashboard).content)
+
+        self.assertIn("cleaned 2×", rendered)
+
+    async def test_the_in_process_dashboard_reports_no_cleanups(self):
+        async with self.app.run_test() as pilot:
+            await pilot.pause()
+            rendered = str(self.app.query_one(Dashboard).content)
+
+        self.assertNotIn("cleaned", rendered)
 
     async def test_remote_tick_keeps_a_paused_countdown_from_hitting_zero(self):
         session = FakeSession(self.config)

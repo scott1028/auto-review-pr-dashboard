@@ -8,7 +8,7 @@ import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from auto_review_pr_dashboard import gh, runner
@@ -58,11 +58,14 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.store = Store(Path(tmp.name) / "state")
         self.events = []
 
-    def make_runner(self, items, **overrides):
+    def make_runner(self, items, recycle_every_loops=None, **overrides):
         config = RunConfig("codex-test-stub", "review", repos=["o/r"], **overrides)
         self.items = items
         return runner.LoopRunner(
-            config, self.store, lambda name, *args: self.events.append((name, args))
+            config,
+            self.store,
+            lambda name, *args: self.events.append((name, args)),
+            recycle_every_loops=recycle_every_loops,
         )
 
     async def run_loop(self, loop_runner, agent_runs=None):
@@ -413,6 +416,138 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started_paused, [False])
         self.assertTrue(loop_runner._stopped)
         self.assertIsNone(loop_runner.blocked_until)
+
+    async def test_recycle_every_loops_returns_after_the_nth_loop(self):
+        loop_runner = self.make_runner([make_item(1)], recycle_every_loops=2)
+        idles = []
+
+        async def fake_idle():
+            idles.append(loop_runner.loop_index)
+
+        async def fake_run_loop():
+            loop_runner.loop_index += 1
+
+        with (
+            patch.object(loop_runner, "_idle_until_next_loop", fake_idle),
+            patch.object(loop_runner, "run_loop", fake_run_loop),
+        ):
+            await loop_runner.run_forever()
+
+        # Loop 2 hands over instead of idling, so the daemon can restart itself.
+        self.assertTrue(loop_runner.is_recycle_requested)
+        self.assertEqual(loop_runner.loop_index, 2)
+        self.assertEqual(idles, [1])
+
+    async def test_a_handed_over_countdown_idles_before_the_first_loop(self):
+        loop_runner = self.make_runner([make_item(1)])
+        loop_runner.next_run_at = 1_500.0
+        order = []
+
+        async def fake_idle():
+            order.append("idle")
+            loop_runner.next_run_at = None
+
+        async def fake_run_loop():
+            order.append("loop")
+            loop_runner.loop_index += 1
+            loop_runner._stopped = True
+
+        with (
+            patch.object(loop_runner, "_idle_until_next_loop", fake_idle),
+            patch.object(loop_runner, "run_loop", fake_run_loop),
+        ):
+            await loop_runner.run_forever()
+
+        # The successor picks the countdown up rather than running a loop at once.
+        self.assertEqual(order, ["idle", "loop"])
+
+    async def test_idle_keeps_a_deadline_it_was_handed(self):
+        loop_runner = self.make_runner([], interval_min=60)
+        loop_runner.next_run_at = 1_030.0
+        clock = FakeTime()
+
+        async def fake_sleep(seconds):
+            clock.now += seconds
+
+        with (
+            patch.object(runner, "time", clock),
+            patch.object(runner.asyncio, "sleep", fake_sleep),
+        ):
+            await loop_runner._idle_until_next_loop()
+
+        # A fresh idle would have replaced this with a full interval from now.
+        self.assertEqual(
+            [args[0] for name, args in self.events if name == "idle_start"],
+            [1_030.0],
+        )
+        self.assertIsNone(loop_runner.next_run_at)
+
+    async def test_stop_kills_an_agent_that_ignores_sigterm(self):
+        stubborn_cli = self.mock_cli.parent / "stubborn-ai"
+        stubborn_cli.write_text("#!/usr/bin/env bash\ntrap '' TERM\nsleep 30\n")
+        stubborn_cli.chmod(0o755)
+        self.mock_cli = stubborn_cli
+        loop_runner = self.make_runner([make_item(1)])
+        agent_pids = []
+
+        async def stop_once_started():
+            while loop_runner._current_process is None:
+                await asyncio.sleep(0.01)
+            agent_pids.append(loop_runner._current_process.pid)
+            loop_runner.stop()
+
+        started_at = time.monotonic()
+        with patch.object(runner, "TERMINATE_GRACE_SEC", 0.2):
+            stop_task = asyncio.create_task(stop_once_started())
+            record = await self.run_loop(loop_runner)
+            await stop_task
+
+        # SIGTERM is trapped, so the grace period has to end in SIGKILL.
+        self.assertLess(time.monotonic() - started_at, 5)
+        self.assertIs(record.items[0].state, PrState.FAILED)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(agent_pids[0], 0)
+
+    async def test_repeated_stop_escalates_the_running_agent_only_once(self):
+        loop_runner = self.make_runner([make_item(1)])
+        os.environ["MOCK_SLEEP"] = "0.5"
+
+        async def stop_three_times_once_started():
+            while loop_runner._current_process is None:
+                await asyncio.sleep(0.01)
+            # The paths that double up in practice: SIGTERM handler plus "stop"
+            # command, or cancel() followed by stop().
+            loop_runner.cancel(loop_runner._current_key)
+            loop_runner.stop()
+            loop_runner.stop()
+
+        with patch.object(loop_runner, "_stop_process", AsyncMock()) as stop_process:
+            stop_task = asyncio.create_task(stop_three_times_once_started())
+            await self.run_loop(loop_runner)
+            await stop_task
+
+        # One process, one escalation task: the guard, not a pile of SIGTERMs.
+        self.assertEqual(stop_process.await_count, 1)
+
+    async def test_agent_started_and_finished_events_bracket_the_agent(self):
+        loop_runner = self.make_runner([make_item(1)])
+
+        await self.run_loop(loop_runner)
+
+        names = [name for name, _ in self.events]
+        started = [args for name, args in self.events if name == "agent_started"]
+        self.assertEqual(len(started), 1)
+        self.assertGreater(started[0][0], 0)
+        self.assertLess(names.index("agent_started"), names.index("agent_finished"))
+
+        # A command that never execs has no process for the daemon to record.
+        self.mock_cli = self.mock_cli.parent / "missing-ai"
+        self.events.clear()
+
+        await self.run_loop(self.make_runner([make_item(1)]))
+
+        self.assertNotIn("agent_started", [name for name, _ in self.events])
+        self.assertNotIn("agent_finished", [name for name, _ in self.events])
 
     async def test_two_silent_failures_trip_breaker(self):
         items = [make_item(1), make_item(2)]

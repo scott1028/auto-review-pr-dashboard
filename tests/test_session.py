@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout, suppress
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from io import StringIO
 from pathlib import Path
 from typing import cast
@@ -30,6 +30,7 @@ from auto_review_pr_dashboard.session import (
     DAEMON_LOG_FILE_NAME,
     MAX_CLIENT_BUFFER_BYTES,
     PROTOCOL_VERSION,
+    RECYCLE_EVERY_LOOPS,
     RuntimeMetadata,
     SessionClient,
     SessionError,
@@ -42,6 +43,13 @@ from auto_review_pr_dashboard.session import (
     start_daemon,
 )
 from auto_review_pr_dashboard.store import Store
+
+
+def kill_agent(process: subprocess.Popen) -> None:
+    """Take a test's stand-in agent down whether or not the test killed it first."""
+    with suppress(ProcessLookupError):
+        process.kill()
+    process.wait()
 
 
 class RuntimeMetadataTestCase(unittest.TestCase):
@@ -78,6 +86,23 @@ class RuntimeMetadataTestCase(unittest.TestCase):
         )
 
         self.assertIsNone(load_runtime_metadata(self.store))
+
+    def test_runtime_metadata_written_before_the_agent_fields_still_loads(self):
+        # A daemon.json from an earlier version has no agent_pgid to read.
+        payload = {
+            "protocol_version": PROTOCOL_VERSION,
+            "run_id": "run-123",
+            "pid": 321,
+            "cwd": "/tmp/workspace",
+            "socket_path": "/tmp/session.sock",
+            "started_at": 123.5,
+            "config": {},
+        }
+
+        metadata = RuntimeMetadata.from_dict(payload)
+
+        self.assertIsNone(metadata.agent_pgid)
+        self.assertIsNone(metadata.agent_start_ticks)
 
     def test_missing_resume_metadata_does_not_start_daemon(self):
         with (
@@ -211,6 +236,7 @@ class FakeRunner:
         self.next_run_at = 200.0
         self.blocked_until = None
         self.block_reason = ""
+        self.is_recycle_requested = False
         self._current_key = item.key
         self.commands = []
         self.on_event = on_event
@@ -301,6 +327,7 @@ class SessionServerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["status"], "Loop #4 · running")
         self.assertEqual(snapshot["current_key"], "o/r#7")
         self.assertFalse(snapshot["paused"])
+        self.assertEqual(snapshot["recycle_count"], 0)
 
     async def test_paused_tick_carries_the_moved_deadline(self):
         reader, _writer = await self.attach()
@@ -455,6 +482,72 @@ class SessionServerTestCase(unittest.IsolatedAsyncioTestCase):
         await second_writer.drain()
         self.assertEqual((await self.read_message(second_reader))["type"], "snapshot")
 
+    async def test_recycle_wipes_tmp_and_hands_the_loop_to_a_new_daemon(self):
+        base_dir = self.socket_path.parent / ".tmp" / "auto-review-pr-dashboard"
+        store = Store(base_dir)
+        store.prepare()
+        other_tool_file = base_dir.parent / "other-tool.md"
+        other_tool_file.write_text("not ours, still cleared", encoding="utf-8")
+        (store.loops_dir / "loop-0004.json").write_text("{}", encoding="utf-8")
+        self.session_server.store = store
+        self.fake_runner.is_recycle_requested = True
+        reader, _writer = await self.attach()
+        await self.read_message(reader)
+
+        with patch.object(session, "_start_daemon_locked") as start_daemon_locked:
+            await self.session_server._recycle()
+
+        self.assertEqual((await self.read_message(reader))["type"], "recycling")
+        # The whole .tmp/ is in scope, other tools' files and our own records alike.
+        self.assertFalse(other_tool_file.exists())
+        self.assertFalse(base_dir.exists())
+        self.assertEqual(start_daemon_locked.call_args.args, (self.config, store))
+        handoff = start_daemon_locked.call_args.kwargs["handoff"]
+        self.assertEqual(handoff["loop_index"], 4)
+        self.assertEqual(handoff["recycle_count"], 1)
+        self.assertFalse(handoff["paused"])
+        self.assertGreater(handoff["next_run_at"], time.time())
+        self.assertEqual(handoff["record"], self.fake_runner.record.to_dict())
+
+    async def test_recycle_leaves_a_base_dir_that_is_not_under_tmp_alone(self):
+        self.store.prepare()
+        self.fake_runner.is_recycle_requested = True
+        state_path = self.store.base_dir / "state.json"
+        state_path.write_text("{}", encoding="utf-8")
+        loop_path = self.store.loops_dir / "loop-0004.json"
+        loop_path.write_text("{}", encoding="utf-8")
+
+        with patch.object(session, "_start_daemon_locked") as start_daemon_locked:
+            await self.session_server._recycle()
+
+        # This store is not under a directory named .tmp, so the guard skips it.
+        self.assertTrue(state_path.exists())
+        self.assertTrue(loop_path.exists())
+        self.assertEqual(start_daemon_locked.call_count, 1)
+
+    async def test_a_failed_recycle_still_shuts_the_daemon_down_and_logs_it(self):
+        self.store.prepare()
+        self.fake_runner.is_recycle_requested = True
+        self.assertTrue(self.socket_path.exists())
+
+        with (
+            patch.object(
+                session, "_take_start_lock", side_effect=OSError("lock failed")
+            ),
+            patch.object(session, "_start_daemon_locked") as start_daemon_locked,
+        ):
+            await self.session_server._recycle()
+
+        # A recycle that never got the lock must still leave no live socket or
+        # daemon.json behind, and the reason has to be readable somewhere.
+        self.assertFalse(self.socket_path.exists())
+        self.assertFalse(get_runtime_path(self.store).exists())
+        start_daemon_locked.assert_not_called()
+        log_text = (self.store.base_dir / session.DAEMON_LOG_FILE_NAME).read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("recycle failed: lock failed", log_text)
+
 
 class ShutdownOrderTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_socket_is_unlinked_while_the_daemon_still_owns_it(self):
@@ -488,6 +581,44 @@ class ShutdownOrderTestCase(unittest.IsolatedAsyncioTestCase):
             await session_server._shutdown()
 
         self.assertEqual(order, ["unlink", "close", "wait_closed"])
+
+
+class RecycleHandoffTestCase(unittest.TestCase):
+    def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.store = Store(Path(temporary_directory.name) / "state")
+        self.config = RunConfig("codex", "review", repos=["o/r"], authors=["me"])
+
+    def test_a_recycled_daemon_carries_the_loop_and_the_clean_count(self):
+        record = LoopRecord(index=10, started_at=100.0, items=[])
+        session_server = SessionServer(
+            self.config,
+            self.store,
+            str(Path.cwd().resolve()),
+            Path("/tmp/not-used.sock"),
+            "run-2",
+            handoff={
+                "loop_index": 10,
+                "next_run_at": 500.0,
+                "paused": True,
+                "record": record.to_dict(),
+                "recycle_count": 2,
+            },
+        )
+
+        snapshot = session_server._get_snapshot()
+
+        # The dashboard must not lose the countdown, the pause, or the table.
+        self.assertEqual(snapshot["recycle_count"], 2)
+        self.assertEqual(snapshot["status"], "Loop #10 · finished")
+        self.assertTrue(snapshot["paused"])
+        self.assertEqual(snapshot["next_run_at"], 500.0)
+        self.assertEqual(snapshot["record"], record.to_dict())
+        self.assertEqual(session_server.runner.loop_index, 10)
+        self.assertEqual(
+            session_server.runner.recycle_every_loops, RECYCLE_EVERY_LOOPS
+        )
 
 
 class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
@@ -607,6 +738,114 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_process_start_ticks_identifies_a_live_pid_and_ignores_a_dead_one(self):
+        agent = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        try:
+            start_ticks = session.get_process_start_ticks(agent.pid)
+            self.assertIsInstance(start_ticks, int)
+            self.assertGreater(start_ticks, 0)
+        finally:
+            kill_agent(agent)
+
+        self.assertIsNone(session.get_process_start_ticks(agent.pid))
+
+    def _start_over_a_crashed_agent(
+        self, workspace: Path, starttime_offset: int
+    ) -> subprocess.Popen:
+        """Run `start_daemon` while a leftover daemon.json names a live agent group.
+
+        `starttime_offset` shifts the recorded starttime: 0 means the group is
+        still the one the crashed daemon knew, anything else is a reused pid.
+        """
+        store = Store(workspace / "state")
+        store.prepare()
+        # start_daemon takes this working directory's flock; unlike a real daemon
+        # run there is no test teardown here, so the lock file gets unlinked.
+        lock_path = Path(get_socket_path(workspace)).with_suffix(".lock")
+        self.addCleanup(lock_path.unlink, missing_ok=True)
+        agent = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(kill_agent, agent)
+        leftover = RuntimeMetadata(
+            protocol_version=PROTOCOL_VERSION,
+            run_id="crashed-run",
+            pid=999_999,
+            cwd=str(workspace.resolve()),
+            socket_path=str(get_socket_path(workspace)),
+            started_at=123.5,
+            config=asdict(RunConfig("codex", "review")),
+            agent_pgid=agent.pid,
+            agent_start_ticks=session.get_process_start_ticks(agent.pid)
+            + starttime_offset,
+        )
+        get_runtime_path(store).write_text(
+            json.dumps(leftover.to_dict()), encoding="utf-8"
+        )
+
+        class FakeProcess:
+            """Publishes runtime metadata the way a real daemon would."""
+
+            returncode = None
+
+            def __init__(self):
+                self.stdin = io.BytesIO()
+
+            def poll(self):
+                get_runtime_path(store).write_text(
+                    json.dumps(
+                        replace(
+                            leftover,
+                            run_id="new-run",
+                            pid=os.getpid(),
+                            agent_pgid=None,
+                            agent_start_ticks=None,
+                        ).to_dict()
+                    ),
+                    encoding="utf-8",
+                )
+                return None
+
+            def wait(self):
+                return 0
+
+        with (
+            patch.object(session.subprocess, "Popen", return_value=FakeProcess()),
+            patch.object(session, "_get_is_socket_live", side_effect=[False, True]),
+        ):
+            started = start_daemon(RunConfig("codex", "review"), store)
+        self.assertEqual(started.run_id, "new-run")
+        return agent
+
+    def test_a_crashed_daemons_agent_is_killed_before_the_next_daemon_starts(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            os.chdir(temporary_directory)
+            try:
+                agent = self._start_over_a_crashed_agent(
+                    Path(temporary_directory), starttime_offset=0
+                )
+                deadline = time.monotonic() + 3
+                while agent.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(agent.poll())
+            finally:
+                os.chdir(original_cwd)
+
+    def test_the_crash_cleanup_does_not_kill_a_process_that_reused_the_pid(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            os.chdir(temporary_directory)
+            try:
+                agent = self._start_over_a_crashed_agent(
+                    Path(temporary_directory), starttime_offset=1
+                )
+                time.sleep(0.3)
+
+                # The starttime says this pid went to somebody else, so it stays.
+                self.assertIsNone(agent.poll())
+            finally:
+                os.chdir(original_cwd)
+
     async def test_detached_daemon_can_attach_stop_and_clean_up(self):
         original_cwd = Path.cwd()
         metadata = None
@@ -651,6 +890,114 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                         os.kill(metadata.pid, signal.SIGTERM)
                     with suppress(ChildProcessError):
                         await asyncio.to_thread(os.waitpid, metadata.pid, 0)
+                    Path(metadata.socket_path).with_suffix(".lock").unlink(
+                        missing_ok=True
+                    )
+                os.chdir(original_cwd)
+
+    async def test_a_daemon_recycles_itself_and_the_client_follows_the_new_run_id(self):
+        original_cwd = Path.cwd()
+        metadata = None
+        new_metadata = None
+        clients = []
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            os.chdir(temporary_directory)
+            store = Store()
+            try:
+                metadata = await asyncio.to_thread(
+                    start_daemon, RunConfig("codex", "review"), store
+                )
+                # Another tool's file in the same .tmp/: part of the wipe scope.
+                other_tool_file = Path(".tmp") / "other-tool.md"
+                other_tool_file.write_text("not ours", encoding="utf-8")
+
+                messages = []
+                client = SessionClient(metadata)
+                clients.append(client)
+                await client.connect(messages.append)
+
+                async def wait_for_message(
+                    candidates, predicate, description, timeout=10
+                ):
+                    deadline = time.monotonic() + timeout
+                    while time.monotonic() < deadline:
+                        for message in candidates:
+                            if predicate(message):
+                                return message
+                        await asyncio.sleep(0.05)
+                    self.fail(f"the daemon never sent {description}")
+
+                # An empty scope ends every loop as soon as it starts, so `n`
+                # walks the runner up to the recycle point.
+                for index in range(1, RECYCLE_EVERY_LOOPS):
+                    await client.send_command("run_now")
+                    await wait_for_message(
+                        messages,
+                        lambda message: (
+                            message.get("type") == "snapshot"
+                            and (message.get("record") or {}).get("index") == index
+                            and message["status"].endswith("finished")
+                        ),
+                        f"loop #{index} finishing",
+                    )
+
+                # Loop 10 hands off instead of idling, and that is what the client
+                # sees rather than another finished snapshot.
+                await client.send_command("run_now")
+                await wait_for_message(
+                    messages,
+                    lambda message: message.get("type") == "recycling",
+                    "the recycling notice",
+                )
+
+                deadline = time.monotonic() + 10
+                while new_metadata is None and time.monotonic() < deadline:
+                    candidate = load_runtime_metadata(store)
+                    if candidate is not None and candidate.run_id != metadata.run_id:
+                        new_metadata = candidate
+                    else:
+                        await asyncio.sleep(0.05)
+                if new_metadata is None:
+                    self.fail("the recycled daemon never published its metadata")
+
+                self.assertNotEqual(new_metadata.pid, metadata.pid)
+                self.assertFalse(other_tool_file.exists())
+                self.assertFalse((store.loops_dir / "loop-0001.json").exists())
+
+                new_messages = []
+                new_client = SessionClient(new_metadata)
+                clients.append(new_client)
+                await new_client.connect(new_messages.append)
+                snapshot = await wait_for_message(
+                    new_messages,
+                    lambda message: message.get("type") == "snapshot",
+                    "a snapshot from the new daemon",
+                )
+
+                self.assertEqual(snapshot["recycle_count"], 1)
+                self.assertEqual(snapshot["record"]["index"], RECYCLE_EVERY_LOOPS)
+                self.assertEqual(
+                    snapshot["status"], f"Loop #{RECYCLE_EVERY_LOOPS} · finished"
+                )
+                self.assertIsNotNone(snapshot["next_run_at"])
+
+                await new_client.send_command("stop")
+                new_client.disconnect()
+                deadline = time.monotonic() + 5
+                while get_runtime_path(store).exists() and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                self.assertFalse(get_runtime_path(store).exists())
+            finally:
+                for client in clients:
+                    client.disconnect()
+                for entry in (metadata, new_metadata):
+                    if entry is None:
+                        continue
+                    with suppress(ProcessLookupError):
+                        os.kill(entry.pid, signal.SIGTERM)
+                    with suppress(ChildProcessError):
+                        await asyncio.to_thread(os.waitpid, entry.pid, 0)
+                if metadata is not None:
                     Path(metadata.socket_path).with_suffix(".lock").unlink(
                         missing_ok=True
                     )

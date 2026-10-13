@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 
 from rich.text import Text
 from textual import events
@@ -24,7 +25,13 @@ from .models import (
     Verdict,
 )
 from .runner import LoopRunner
-from .session import SessionClient, SessionError
+from .session import (
+    DAEMON_LOG_FILE_NAME,
+    SessionClient,
+    SessionError,
+    get_resume_error,
+    load_runtime_metadata,
+)
 from .stats import format_duration, get_progress_bar, get_repo_progress_text, get_stats
 from .store import Store
 
@@ -32,6 +39,9 @@ MAX_BUFFERED_LOG_LINES = 2000
 # How far back to read a log file when its lines are no longer buffered - a long
 # agent run writes far more than any panel shows.
 LOG_TAIL_BYTES = 256 * 1024
+# A recycled daemon is usually back within a second; this only has to outlast a
+# slow disk or a launch that lost the race for the startup lock.
+RECYCLE_REATTACH_TIMEOUT_SEC = 30
 
 STATE_STYLE = {
     PrState.QUEUED: "dim",
@@ -433,6 +443,10 @@ class AutoReviewPrDashboardApp(App):
         self.block_reason = ""
         self.block_remaining: float | None = None
         self.blocked_until: float | None = None
+        # How many times this daemon run has wiped .tmp/, and whether the one we
+        # were attached to is mid-recycle right now.
+        self.recycle_count = 0
+        self.is_recycling = False
         self._log_buffer: dict[str, list[str]] = {}
         # Which agent's output the activity panel is following, and whether the
         # user pinned it open (otherwise it auto-hides once the queue is ready).
@@ -486,6 +500,33 @@ class AutoReviewPrDashboardApp(App):
             self.notify(str(error), severity="error", timeout=10)
             self.exit(result="connection-error")
 
+    async def reattach_session(self) -> None:
+        """Follow a recycled daemon: wait for its metadata, then attach again."""
+        previous_run_id = None if self.session is None else self.session.metadata.run_id
+        deadline = time.monotonic() + RECYCLE_REATTACH_TIMEOUT_SEC
+        while True:
+            metadata = load_runtime_metadata(self.store)
+            if (
+                metadata is not None
+                and metadata.run_id != previous_run_id
+                and not get_resume_error(metadata, str(Path.cwd().resolve()))
+            ):
+                self.session = SessionClient(metadata)
+                await self.connect_session()
+                self.is_recycling = False
+                return
+            if time.monotonic() >= deadline:
+                self.notify(
+                    "the restarted daemon did not become attachable within "
+                    f"{RECYCLE_REATTACH_TIMEOUT_SEC}s; see "
+                    f"{self.store.base_dir / DAEMON_LOG_FILE_NAME}",
+                    severity="error",
+                    timeout=10,
+                )
+                self.exit(result="disconnected")
+                return
+            await asyncio.sleep(0.2)
+
     def handle_session_message(self, message: dict) -> None:
         message_type = message.get("type")
         if message_type == "snapshot":
@@ -506,6 +547,7 @@ class AutoReviewPrDashboardApp(App):
             self.blocked_until = message.get("blocked_until")
             self.block_reason = message.get("block_reason", "")
             self.phase_started_at = message["phase_started_at"]
+            self.recycle_count = message.get("recycle_count", 0)
             current_key = message.get("current_key")
             if current_key is not None and current_key != self.activity_key:
                 # Switching through show_activity_log() clears the panel, replays
@@ -529,12 +571,21 @@ class AutoReviewPrDashboardApp(App):
             )
         elif message_type == "error":
             self.notify(message["message"], severity="error", timeout=10)
-            if message.get("fatal"):
+            # Mid-recycle the old daemon closing with a keypress in flight hits
+            # ECONNRESET; the "disconnected" message that follows reattaches.
+            if message.get("fatal") and not self.is_recycling:
                 self.exit(result="connection-error")
         elif message_type == "replaced":
             self.notify(message["message"], severity="warning")
             self.exit(result="replaced")
+        elif message_type == "recycling":
+            # The daemon is restarting itself; its socket closing is expected.
+            self.is_recycling = True
+            self.notify(message["message"], severity="warning")
         elif message_type == "disconnected":
+            if self.is_recycling:
+                self.run_worker(self.reattach_session(), name="reattach")
+                return
             self.notify(message["message"], severity="error")
             self.exit(result="disconnected")
 
@@ -622,6 +673,9 @@ class AutoReviewPrDashboardApp(App):
         elif self.session is not None:
             self.block_remaining = None
         status = f"{self.status} · {self.get_phase_elapsed_text()}"
+        if self.session is not None:
+            # Only a daemon recycles, so the in-process loop reports nothing.
+            status = f"{status} · cleaned {self.recycle_count}×"
         if self.paused:
             status = f"{status} · [yellow]paused[/yellow]"
         block = (
