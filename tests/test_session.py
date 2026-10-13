@@ -1,10 +1,13 @@
 """Detached session metadata, lifecycle, and IPC behavior."""
 
 import asyncio
+import fcntl
 import io
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,6 +46,48 @@ from auto_review_pr_dashboard.session import (
     start_daemon,
 )
 from auto_review_pr_dashboard.store import Store
+
+ISOLATED_TEMP_DIR = ""
+_previous_tempdir = None
+_previous_tmpdir = None
+
+
+def setUpModule() -> None:
+    """Pin every tempdir in this module away from the real /tmp runtime dir.
+
+    start_daemon sweeps stale .lock/.sock pairs out of whatever gettempdir()
+    points at: unisolated, a test that forces liveness False would delete the
+    files of a daemon the user is really running elsewhere. TMPDIR is set too
+    because test_daemon_survives_the_process_that_launched_it runs start_daemon
+    in a child python that resolves gettempdir() from the environment.
+    """
+    global ISOLATED_TEMP_DIR, _previous_tempdir, _previous_tmpdir
+    # Short prefix: AF_UNIX socket paths are capped at 108 bytes.
+    ISOLATED_TEMP_DIR = tempfile.mkdtemp(prefix="arpd.")
+    _previous_tempdir = tempfile.tempdir
+    _previous_tmpdir = os.environ.get("TMPDIR")
+    tempfile.tempdir = ISOLATED_TEMP_DIR
+    os.environ["TMPDIR"] = ISOLATED_TEMP_DIR
+
+
+def tearDownModule() -> None:
+    global ISOLATED_TEMP_DIR
+    tempfile.tempdir = _previous_tempdir
+    if _previous_tmpdir is None:
+        os.environ.pop("TMPDIR", None)
+    else:
+        os.environ["TMPDIR"] = _previous_tmpdir
+    shutil.rmtree(ISOLATED_TEMP_DIR, ignore_errors=True)
+    ISOLATED_TEMP_DIR = ""
+
+
+class RuntimeDirIsolationTestCase(unittest.TestCase):
+    def test_socket_paths_resolve_inside_the_isolated_temp_dir(self):
+        runtime_dir = get_socket_path(Path.cwd()).parent
+        self.assertEqual(
+            runtime_dir,
+            Path(ISOLATED_TEMP_DIR) / f"auto-review-pr-dashboard-{os.getuid()}",
+        )
 
 
 def kill_agent(process: subprocess.Popen) -> None:
@@ -548,6 +593,20 @@ class SessionServerTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("recycle failed: lock failed", log_text)
 
+    async def test_recycle_sweeps_the_runtime_dir_after_the_successor_starts(self):
+        self.store.prepare()
+        self.fake_runner.is_recycle_requested = True
+
+        with (
+            patch.object(session, "_start_daemon_locked"),
+            patch.object(session, "_remove_stale_runtime_files") as sweep,
+        ):
+            await self.session_server._recycle()
+
+        # The successor's socket is live and this daemon's own lock is held, so
+        # the sweep can only ever clear older stale pairs.
+        sweep.assert_called_once_with(self.socket_path.parent)
+
 
 class ShutdownOrderTestCase(unittest.IsolatedAsyncioTestCase):
     async def test_socket_is_unlinked_while_the_daemon_still_owns_it(self):
@@ -581,6 +640,80 @@ class ShutdownOrderTestCase(unittest.IsolatedAsyncioTestCase):
             await session_server._shutdown()
 
         self.assertEqual(order, ["unlink", "close", "wait_closed"])
+
+
+class StaleRuntimeFileSweepTestCase(unittest.TestCase):
+    def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        # Never the real /tmp runtime directory: the sweep deletes what it finds.
+        self.runtime_dir = Path(temporary_directory.name)
+
+    def test_a_stale_lock_and_its_socket_are_swept(self):
+        (self.runtime_dir / "a.lock").write_text("", encoding="utf-8")
+        # A plain file answers no connect, so the pair counts as stale.
+        (self.runtime_dir / "a.sock").write_text("not a socket", encoding="utf-8")
+
+        session._remove_stale_runtime_files(self.runtime_dir)
+
+        self.assertFalse((self.runtime_dir / "a.lock").exists())
+        self.assertFalse((self.runtime_dir / "a.sock").exists())
+
+    def test_a_held_lock_and_its_socket_survive_the_sweep(self):
+        held = (self.runtime_dir / "b.lock").open("a", encoding="utf-8")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        self.addCleanup(held.close)
+        (self.runtime_dir / "b.sock").write_text("", encoding="utf-8")
+
+        session._remove_stale_runtime_files(self.runtime_dir)
+
+        self.assertTrue((self.runtime_dir / "b.lock").exists())
+        self.assertTrue((self.runtime_dir / "b.sock").exists())
+
+    def test_a_live_socket_pair_survives_the_sweep(self):
+        (self.runtime_dir / "c.lock").write_text("", encoding="utf-8")
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(self.runtime_dir / "c.sock"))
+        listener.listen(1)
+        self.addCleanup(listener.close)
+
+        session._remove_stale_runtime_files(self.runtime_dir)
+
+        self.assertTrue((self.runtime_dir / "c.lock").exists())
+        self.assertTrue((self.runtime_dir / "c.sock").exists())
+
+    def test_a_lock_without_a_socket_is_swept(self):
+        (self.runtime_dir / "d.lock").write_text("", encoding="utf-8")
+
+        session._remove_stale_runtime_files(self.runtime_dir)
+
+        self.assertFalse((self.runtime_dir / "d.lock").exists())
+
+    def test_take_start_lock_retries_when_the_lock_is_swapped_under_it(self):
+        socket_path = self.runtime_dir / "x.sock"
+        held = (self.runtime_dir / "x.lock").open("a", encoding="utf-8")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        taken = {}
+
+        def take_lock():
+            taken["lock_file"] = session._take_start_lock(socket_path)
+
+        taker = threading.Thread(target=take_lock)
+        taker.start()
+        # The sweep pattern: unlink the lock a waiter is blocked on, then let
+        # it wake - the waiter must reject that dead inode and reopen the path.
+        (self.runtime_dir / "x.lock").unlink()
+        held.close()
+        taker.join(5)
+
+        self.assertFalse(taker.is_alive())
+        lock_file = taken["lock_file"]
+        self.addCleanup(lock_file.close)
+        path_stat = os.stat(self.runtime_dir / "x.lock")
+        fd_stat = os.stat(lock_file.fileno())
+        self.assertEqual(
+            (path_stat.st_dev, path_stat.st_ino), (fd_stat.st_dev, fd_stat.st_ino)
+        )
 
 
 class RecycleHandoffTestCase(unittest.TestCase):
@@ -665,6 +798,9 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                     patch.object(
                         session, "load_runtime_metadata", return_value=metadata
                     ),
+                    # The sweep has tests of its own; its socket probes would
+                    # overrun the finite side_effect above.
+                    patch.object(session, "_remove_stale_runtime_files"),
                 ):
                     started = start_daemon(RunConfig("codex", "review"), store)
 
@@ -724,6 +860,9 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                 with (
                     patch.object(session.subprocess, "Popen", return_value=process),
                     patch.object(session, "_get_is_socket_live", return_value=False),
+                    # Liveness is forced False here, so the real sweep would
+                    # clear pairs it must not judge stale.
+                    patch.object(session, "_remove_stale_runtime_files"),
                     self.assertRaises(SessionError) as raised,
                 ):
                     start_daemon(RunConfig("codex", "review"), store)
@@ -810,6 +949,9 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
         with (
             patch.object(session.subprocess, "Popen", return_value=FakeProcess()),
             patch.object(session, "_get_is_socket_live", side_effect=[False, True]),
+            # The sweep has tests of its own; running it for real here would
+            # add socket probes beyond the two the finite side_effect allows.
+            patch.object(session, "_remove_stale_runtime_files"),
         ):
             started = start_daemon(RunConfig("codex", "review"), store)
         self.assertEqual(started.run_id, "new-run")
@@ -846,6 +988,28 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
             finally:
                 os.chdir(original_cwd)
 
+    def test_start_daemon_sweeps_the_runtime_dir_under_its_lock(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            os.chdir(temporary_directory)
+            try:
+                store = Store(Path(temporary_directory) / "state")
+                socket_path = get_socket_path(Path(temporary_directory).resolve())
+                self.addCleanup(
+                    socket_path.with_suffix(".lock").unlink, missing_ok=True
+                )
+
+                with (
+                    patch.object(session, "_start_daemon_locked"),
+                    patch.object(session, "_remove_stale_runtime_files") as sweep,
+                ):
+                    start_daemon(RunConfig("codex", "review"), store)
+
+                # Sweeping inside the held lock is what keeps it race-free.
+                sweep.assert_called_once_with(socket_path.parent)
+            finally:
+                os.chdir(original_cwd)
+
     async def test_detached_daemon_can_attach_stop_and_clean_up(self):
         original_cwd = Path.cwd()
         metadata = None
@@ -876,12 +1040,17 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
 
                 await client.send_command("stop")
                 client.disconnect()
+                lock_path = Path(metadata.socket_path).with_suffix(".lock")
                 deadline = time.monotonic() + 5
-                while get_runtime_path(store).exists() and time.monotonic() < deadline:
+                # The lock goes last: the sweep runs after daemon.json is removed.
+                while (
+                    get_runtime_path(store).exists() or lock_path.exists()
+                ) and time.monotonic() < deadline:
                     await asyncio.sleep(0.05)
 
                 self.assertFalse(get_runtime_path(store).exists())
                 self.assertFalse(Path(metadata.socket_path).exists())
+                self.assertFalse(lock_path.exists())
             finally:
                 if client is not None:
                     client.disconnect()

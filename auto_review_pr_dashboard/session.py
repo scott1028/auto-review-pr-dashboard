@@ -189,9 +189,8 @@ def start_daemon(
     socket_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(socket_path.parent, 0o700)
 
-    lock_path = socket_path.with_suffix(".lock")
-    with lock_path.open("a", encoding="utf-8") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    with _take_start_lock(socket_path) as lock_file:
+        _remove_stale_runtime_files(socket_path.parent)
         return _start_daemon_locked(config, store, handoff)
 
 
@@ -334,10 +333,65 @@ def _take_start_lock(socket_path: Path) -> TextIOWrapper:
 
     Runs off the event loop: the lock can be held by a launch that is still
     starting a daemon. The caller keeps the file referenced until it exits.
+
+    flock locks an inode, not a name, and the stale sweep unlinks locks out
+    from under waiters: after waking, only a path still naming this fd's file
+    means the lock is real, so verify that and start over on the replacement.
     """
-    lock_file = socket_path.with_suffix(".lock").open("a", encoding="utf-8")
-    fcntl.flock(lock_file, fcntl.LOCK_EX)
-    return lock_file
+    lock_path = socket_path.with_suffix(".lock")
+    while True:
+        lock_file = lock_path.open("a", encoding="utf-8")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                path_stat = os.stat(lock_path)
+            except FileNotFoundError:
+                path_stat = None
+            fd_stat = os.stat(lock_file.fileno())
+        except OSError:
+            # Close before re-raising: only a verified mismatch may loop on.
+            lock_file.close()
+            raise
+        if (
+            path_stat is not None
+            and (path_stat.st_dev, path_stat.st_ino)
+            == (fd_stat.st_dev, fd_stat.st_ino)
+        ):
+            return lock_file
+        lock_file.close()
+
+
+def _remove_stale_runtime_files(runtime_dir: Path) -> None:
+    """Unlink `.lock`/`.sock` pairs no launch holds and no daemon serves.
+
+    A launch or recycle holds its own lock, and LOCK_NB skips it: a second fd on
+    the same inode conflicts even within one process. A stopping daemon holds
+    none, so its own pair is swept as well. Every failure is swallowed per
+    pair, so the sweep never blocks or fails a launch or a recycle.
+    """
+    for lock_path in runtime_dir.glob("*.lock"):
+        try:
+            # "r", not "a": the sweep must not recreate a lock it just raced.
+            with lock_path.open("r", encoding="utf-8") as lock_file:
+                # BlockingIOError here means a live launch or recycle owns the
+                # pair.
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                path_stat = os.stat(lock_path)
+                fd_stat = os.stat(lock_file.fileno())
+                if (path_stat.st_dev, path_stat.st_ino) != (
+                    fd_stat.st_dev,
+                    fd_stat.st_ino,
+                ):
+                    continue
+                socket_path = lock_path.with_suffix(".sock")
+                if _get_is_socket_live(socket_path):
+                    continue
+                socket_path.unlink(missing_ok=True)
+                lock_path.unlink(missing_ok=True)
+        except OSError:
+            # FileNotFoundError (raced deletion), BlockingIOError (held lock)
+            # or anything else: skip this pair and keep sweeping.
+            continue
 
 
 def _get_is_socket_live(socket_path: Path) -> bool:
@@ -501,6 +555,8 @@ class SessionServer:
                 await self._recycle()
             else:
                 await self._shutdown()
+                # Holds no lock and the socket is gone, so this cwd's own pair goes too.
+                _remove_stale_runtime_files(self.socket_path.parent)
 
     def _install_signal_handlers(self) -> None:
         event_loop = asyncio.get_running_loop()
@@ -753,6 +809,9 @@ class SessionServer:
                 "recycle_count": self.recycle_count + 1,
             }
             _start_daemon_locked(self.config, self.store, handoff=handoff)
+            # The successor's socket is live and this process still holds its
+            # lock, so the sweep skips that pair and clears older stale ones.
+            _remove_stale_runtime_files(self.socket_path.parent)
         except Exception as error:
             # Any recycle failure, not just SessionError. This process' own stdout
             # is a deleted file by now, so the successor's log is the only place

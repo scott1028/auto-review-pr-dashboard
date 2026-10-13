@@ -126,9 +126,9 @@ Why the extra hop, instead of running the loop inside the TUI:
   snapshot, and a client buffering past 1 MiB is dropped.
 - **One daemon per working directory, on a unix socket** at
   `/tmp/auto-review-pr-dashboard-<uid>/<cwd-hash>.sock` (mode `0700`, a sibling `.lock`
-  serialising startup) — local only, no port, no auth to get wrong, though the handshake
-  still checks protocol version, run id, and cwd. Artifacts and the daemon share one
-  scope, so a second launch in that directory is refused, not interleaved.
+  serialising startup; each launch, recycle and stop deletes `.lock`/`.sock` pairs nobody
+  holds and no daemon serves) — local only, no port, no auth, and the handshake checks
+  protocol version, run id, and cwd; one shared scope refuses a second launch there.
 - **A long run renews itself.** `run_forever` returns on a recycle, the daemon takes that
   `.lock`, wipes `.tmp/`, and hands the loop state to its successor on stdin; the TUI
   waits for the new `run_id` in `daemon.json` and reattaches without losing the screen.
@@ -193,7 +193,7 @@ dirs** (10 loops, not 10 hours); `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
 ## Tests
 
 ```bash
-make test                               # 125 tests, no network
+make test                               # 133 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
 
