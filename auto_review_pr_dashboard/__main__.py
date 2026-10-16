@@ -128,6 +128,13 @@ def get_parser() -> argparse.ArgumentParser:
         help="wait this long after a suspected usage limit before retrying (default: 30)",
     )
     parser.add_argument(
+        "--parallel",
+        type=int,
+        default=1,
+        metavar="N",
+        help="review up to N PRs at once (default: 1)",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="discover PRs and print the verdict table, without starting any AI process",
@@ -224,6 +231,8 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
         parser.error("--pr-timeout must be a positive integer")
     if args.cooldown < 1:
         parser.error("--cooldown must be a positive integer")
+    if args.parallel < 1:
+        parser.error("--parallel must be a positive integer")
 
     repos, urls = get_scope_flags(parser, args)
 
@@ -239,6 +248,7 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
         cooldown_min=args.cooldown,
         dry_run=args.dry_run,
         ai_cli_args=ai_cli_args,
+        max_parallel=args.parallel,
     )
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import subprocess
 import time
 from collections import deque
 
@@ -75,13 +76,18 @@ class LoopRunner:
 
         self._stopped = False
         self._run_now = False
-        self._current_key: str | None = None
-        self._current_process: asyncio.subprocess.Process | None = None
+        # Running PRs in start order, so the last one is the newest.
+        self._running_keys: list[str] = []
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._cancelled_keys: set[str] = set()
         # The one escalation task per process, kept referenced so it is not
         # garbage-collected before it runs.
-        self._stop_task: asyncio.Task | None = None
-        self._stop_task_process: asyncio.subprocess.Process | None = None
+        self._stop_tasks: dict[asyncio.subprocess.Process, asyncio.Task] = {}
+
+    @property
+    def current_key(self) -> str | None:
+        """The newest running PR, which the activity panel follows."""
+        return self._running_keys[-1] if self._running_keys else None
 
     # ---- events -------------------------------------------------------------
 
@@ -93,9 +99,9 @@ class LoopRunner:
     def stop(self) -> None:
         self._stopped = True
         self._run_now = True
-        if self._current_process is not None:
+        for process in list(self._processes.values()):
             # Escalates like cancel() does: SIGTERM, then SIGKILL after the grace.
-            self._schedule_stop(self._current_process)
+            self._schedule_stop(process)
 
     def run_now(self) -> None:
         """Skip whatever countdown is running - idle between loops, or a cooldown."""
@@ -119,11 +125,12 @@ class LoopRunner:
             self.emit("item_update", item)
             return True
 
-        if self._current_process is not None and self._current_key == key:
+        process = self._processes.get(key)
+        if process is not None:
             item.error = "cancel requested"
             self.emit("item_update", item)
             # SIGTERM now, SIGKILL after the grace period if it ignores us.
-            self._schedule_stop(self._current_process)
+            self._schedule_stop(process)
         return True
 
     def resume(self, key: str) -> bool:
@@ -149,12 +156,11 @@ class LoopRunner:
 
     def _schedule_stop(self, process) -> None:
         """Escalate one process at most once, however many paths ask for it."""
-        if self._stop_task_process is process:
+        if process in self._stop_tasks:
             return
-        self._stop_task_process = process
         # Keep the task on self: a bare create_task can be garbage-collected
         # before it ever runs.
-        self._stop_task = asyncio.get_running_loop().create_task(
+        self._stop_tasks[process] = asyncio.get_running_loop().create_task(
             self._stop_process(process)
         )
 
@@ -227,20 +233,45 @@ class LoopRunner:
         self.consecutive_failures = 0
         self.emit("items_ready", self.record)
 
-        while self.queue and not self._stopped:
-            await self._wait_until_runnable()
-            if self._stopped:
-                break
-            key = self.queue.popleft()
-            item = self.record.item_by_key(key)
-            if item is None or item.state is not PrState.QUEUED:
-                continue
-            await self._run_item(item)
+        await self._run_queue()
 
         self.record.finished_at = time.time()
         self.store.save_loop(self.record)
         self.emit("loop_end", self.record)
         return self.record
+
+    async def _run_queue(self) -> None:
+        """Start queued PRs while a slot is free, until nothing is queued or running."""
+        running: set[asyncio.Task] = set()
+        try:
+            while True:
+                if running and (
+                    len(running) >= self.config.max_parallel
+                    or not self.queue
+                    or self._stopped
+                ):
+                    done, running = await asyncio.wait(
+                        running, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        task.result()
+                    continue
+                if not self.queue or self._stopped:
+                    return
+                # The only caller, so one countdown ticks however many PRs run.
+                await self._wait_until_runnable()
+                # A cancel during the wait can empty the queue.
+                if self._stopped or not self.queue:
+                    continue
+                item = self.record.item_by_key(self.queue.popleft())
+                if item is None or item.state is not PrState.QUEUED:
+                    continue
+                running.add(asyncio.create_task(self._run_item(item)))
+        except Exception:
+            # Agents live in their own process groups: never leave them behind.
+            self.stop()
+            await asyncio.gather(*running, return_exceptions=True)
+            raise
 
     async def _wait_until_runnable(self) -> None:
         """Hold the queue until neither a pause nor a cooldown stops the next PR."""
@@ -289,7 +320,11 @@ class LoopRunner:
         keeps its place instead of being punished for the outage.
         """
         item.block_attempts += 1
-        if not self.start_cooldown(f"{item.key}: {reason}", item.key, item.error):
+        if self.blocked_until is not None:
+            # Another agent's block is already counting down: same outage, so no
+            # new event, no fresh deadline, and the breaker starts over.
+            self.consecutive_failures = 0
+        elif not self.start_cooldown(f"{item.key}: {reason}", item.key, item.error):
             return False
 
         item.state = PrState.QUEUED
@@ -328,9 +363,7 @@ class LoopRunner:
 
     # ---- one PR -------------------------------------------------------------
 
-    async def _spawn_agent(
-        self, command, log_path, timeout_sec, log_key=None
-    ) -> AgentRun:
+    async def _spawn_agent(self, command, log_path, timeout_sec, log_key) -> AgentRun:
         """Run one agent process, streaming its output to a log file."""
         output_tail: deque[str] = deque(maxlen=OUTPUT_TAIL_LINES)
         error = ""
@@ -356,10 +389,13 @@ class LoopRunner:
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                 )
-                self._current_process = process
+                self._processes[log_key] = process
                 is_spawned = True
                 # The daemon records the group so a crash cannot orphan this agent.
                 self.emit("agent_started", process.pid)
+                if self._stopped or log_key in self._cancelled_keys:
+                    # q or c landed before there was a process to signal.
+                    self._schedule_stop(process)
                 try:
                     await asyncio.wait_for(
                         self._pump_output(process, log_key, log_file, output_tail),
@@ -385,9 +421,10 @@ class LoopRunner:
             error = str(os_error)
             exit_code = 1
         finally:
-            self._current_process = None
             if is_spawned:
-                self.emit("agent_finished")
+                del self._processes[log_key]
+                self._stop_tasks.pop(process, None)
+                self.emit("agent_finished", process.pid)
 
         return AgentRun(
             exit_code=exit_code,
@@ -401,7 +438,7 @@ class LoopRunner:
         item.error = ""
         item.started_at = time.time()
         item.log_path = str(self.store.get_log_path(self.loop_index, item))
-        self._current_key = item.key
+        self._running_keys.append(item.key)
         self.emit("item_update", item)
 
         before = await self._snapshot(item)
@@ -420,11 +457,15 @@ class LoopRunner:
                 log_key=item.key,
             )
         finally:
-            self._current_key = None
+            self._running_keys.remove(item.key)
         item.exit_code = run.exit_code
 
         after = await self._snapshot(item)
-        item.new_posts = gh.classify_new_posts(before, after)
+        # Without both snapshots, what the agent posted is unknown.
+        is_posting_unknown = before is None or after is None
+        item.new_posts = (
+            [] if is_posting_unknown else gh.classify_new_posts(before, after)
+        )
         item.finished_at = time.time()
 
         if item.key in self._cancelled_keys:
@@ -440,10 +481,17 @@ class LoopRunner:
             self.emit("item_update", item)
             return
 
-        self._handle_failure(item, run.output_tail, run.timed_out, run.error)
+        self._handle_failure(
+            item, run.output_tail, run.timed_out, run.error, is_posting_unknown
+        )
 
     def _handle_failure(
-        self, item: PrItem, output_tail, timed_out, preset_error
+        self,
+        item: PrItem,
+        output_tail,
+        timed_out,
+        preset_error,
+        is_posting_unknown=False,
     ) -> None:
         """A failed run is either this PR's problem, or the whole run is blocked."""
         failure_text = "\n".join(output_tail)
@@ -456,14 +504,31 @@ class LoopRunner:
             )
             or f"agent exited with {item.exit_code}"
         )
+        if is_posting_unknown:
+            item.error = f"{item.error} \u00b7 comment snapshot failed: posts unknown"
 
         self.consecutive_failures += 1
         is_usage_limit = get_is_usage_limit(failure_text)
+        # A failure landing during a cooldown is presumed the same outage; a
+        # timeout is still the PR's own problem.
+        is_during_cooldown = self.blocked_until is not None and not timed_out
         is_systemic = (
-            is_usage_limit or self.consecutive_failures >= SYSTEMIC_FAILURE_THRESHOLD
+            is_usage_limit
+            or is_during_cooldown
+            or self.consecutive_failures >= SYSTEMIC_FAILURE_THRESHOLD
         )
+        # Agents still running when the loop gave up must not log more blocks.
+        is_loop_abandoned = len(self.record.block_events) > MAX_BLOCKS_PER_LOOP
 
-        if not is_systemic or item.new_posts:
+        # A rerun could duplicate posted, or possibly posted, comments; and a run
+        # killed by `q` is not an outage.
+        if (
+            not is_systemic
+            or item.new_posts
+            or is_posting_unknown
+            or self._stopped
+            or is_loop_abandoned
+        ):
             item.state = PrState.FAILED
             self.emit("item_update", item)
             return
@@ -482,12 +547,14 @@ class LoopRunner:
             f"blocked {MAX_BLOCKS_PER_LOOP} times this loop; giving up until the next loop"
         )
 
-    async def _snapshot(self, item: PrItem) -> dict:
+    async def _snapshot(self, item: PrItem) -> dict | None:
+        """The PR's comments by id, or None when gh could not fetch them."""
         try:
             return await asyncio.to_thread(gh.snapshot_comments, item.repo, item.number)
-        except gh.GhError as error:
+        except (gh.GhError, subprocess.SubprocessError, OSError) as error:
+            # A gh timeout or a missing gh fails this snapshot, not the whole loop.
             self.emit("error", f"{item.key}: comment snapshot failed: {error}")
-            return {"review": {}, "issue": {}}
+            return None
 
     async def _pump_output(self, process, log_key, log_file, output_tail) -> None:
         """Stream the agent's output, splitting lines ourselves.

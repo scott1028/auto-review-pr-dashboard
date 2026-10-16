@@ -10,14 +10,13 @@ with `gh`, then runs **one AI process per PR**, so progress, per-PR logs, and ca
 make install
 ```
 
-`uv tool install .` puts an `auto-review-pr-dashboard` executable on `PATH`, and a
-symlink at `~/.bashrc.d/auto-review-pr-dashboard` defines a shell function of the same
-name. The wrapper exports the selected AI function; open a new shell afterwards.
-
-The wrapper passes a function through `BASH_FUNC_<name>%%`. Each PR runs in `bash -ic`,
-which loads `~/.bashrc` before invoking `ai_cli`, so functions defined there are available
-even if the wrapper was bypassed — unless `~/.bashrc` defines the same name, which
-replaces the exported one. Shell startup output is captured in the PR log.
+`uv tool install .` puts an `auto-review-pr-dashboard` executable on `PATH`, and a symlink
+at `~/.bashrc.d/auto-review-pr-dashboard` defines a shell function of the same name, which
+exports the selected AI function through `BASH_FUNC_<name>%%`; open a new shell
+afterwards. Each PR runs in `bash -ic` (`tests/test_config_parity.py` asserts it), which
+loads `~/.bashrc` before invoking `ai_cli`, so functions defined there are available even
+if the wrapper was bypassed — unless `~/.bashrc` defines the same name, which replaces the
+exported one. Shell startup output is captured in the PR log.
 
 | Target | Action |
 |---|---|
@@ -47,6 +46,7 @@ auto-review-pr-dashboard -l
   --interval MIN      minutes between loops (default: 60)
   --pr-timeout MIN    kill one PR's AI process after this long (default: 30)
   --cooldown MIN      wait this long after a suspected usage limit (default: 30)
+  --parallel N        review up to N PRs at once (default: 1)
   --dry-run           discover, print the verdict table, review nothing
   -l, --list          list working directories with a live daemon to resume
   -- ARGS...          pass ARGS to <ai_cli> after its built-in flags, before the prompt
@@ -89,11 +89,11 @@ persists it, so later edits — and `--resume` — never change that run.
 | `c` | list / detail | cancel this PR — running agent gets its process group killed |
 | `r` | list / detail | resume a cancelled PR at the tail of this loop's queue |
 | `n` | anywhere | skip whatever countdown is running — idle wait or cooldown |
-| `p` | anywhere | pause (finishes the current PR, then holds; countdown freezes) |
+| `p` | anywhere | pause (finishes the running PRs, then holds; countdown freezes) |
 | `l` | anywhere | show / hide the live agent log panel |
 | `d` | anywhere | background the run — detach and close the dashboard, daemon keeps going |
 | `f` / `esc` | detail | toggle log follow / back to the list |
-| `q` | anywhere | stop the daemon (its agent gets SIGTERM, then SIGKILL after `TERMINATE_GRACE_SEC` — 5s, in `runner.py`) and quit — asks first while a PR runs, `No` preselected |
+| `q` | anywhere | stop the daemon (every agent gets SIGTERM, then SIGKILL after `TERMINATE_GRACE_SEC` — 5s, in `runner.py`) and quit — asks first while a PR runs, `No` preselected |
 
 ## Architecture: TUI → IPC → Service
 
@@ -107,7 +107,7 @@ persists it, so later edits — and `--resume` — never change that run.
     close it, lose nothing       │   queue, gh, one agent per PR    │
     --resume reattaches          │ store.py — .tmp/ artifacts       │
                                  └──────────────────────────────────┘
-                                       └─▶ its process group: <ai_cli> on one PR
+                                       └─▶ a process group per running PR: <ai_cli>
 ```
 
 Why the extra hop, instead of running the loop inside the TUI:
@@ -143,7 +143,7 @@ Why the extra hop, instead of running the loop inside the TUI:
    `gh pr view --json headRefOid,comments` and the latest
    `<!-- review-pr-branches: head=<sha> -->` marker decide `Full` / `Incremental` /
    `Skip`. A `Skip` stays visible but starts no agent; the verdict is display + queue.
-3. **Review** — one agent process per remaining PR, sequentially, from `prompt.md`.
+3. **Review** — one agent per remaining PR, `--parallel` at once, from `prompt.md`.
 4. **Diff** — comment ids are snapshotted before and after each run, so "what got
    posted" comes from GitHub, never from parsing agent output; only comments carrying
    this skill's markers count, so a teammate's mid-run comment is not credited.
@@ -155,9 +155,11 @@ tail matches a quota pattern (`usage limit`, `429`, `quota`, ...), or two failur
 a row whatever the wording — which also catches lost auth, a broken CLI, dead network.
 The PR then returns to the **front** of the queue as `queued` and the loop suspends for
 `--cooldown` minutes behind a banner `n` can skip, so the rest of the queue is not burned
-seconds after the first failure. A run that had already posted comments is marked `failed`
-instead, since a rerun could duplicate them; after 3 cooldowns the loop gives up and waits
-for `--interval`. Every failure records the agent's last output in the PR's `error` field.
+seconds after the first failure; running `--parallel` agents finish, and their failures
+join that block. A run that had already posted comments, or whose comment snapshot failed
+so nobody knows, is marked `failed` instead, since a rerun could duplicate them; after 3
+cooldowns the loop gives up and waits for `--interval`. Every failure records the agent's
+last output in the PR's `error` field.
 
 ## Artifacts
 
@@ -179,13 +181,13 @@ dirs** (10 loops, not 10 hours); `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
 
 ## Caveats
 
-- A daemon that dies without cleaning up leaves its agent running; the next start kills
-  that process group from `agent_pgid` in `daemon.json`, and leaves it alone if the pid
-  has since been reused. A descendant that called `setsid` itself is out of reach.
-- `-l` reads `/proc`: Linux-only and current user only. Concurrency is fixed at one PR
-  at a time, and a TTY is required.
+- A daemon that dies without cleaning up leaves its agents running; the next start kills
+  those process groups from `agent_groups` in `daemon.json`, skipping any whose pid has
+  since been reused. A descendant that called `setsid` itself is out of reach.
+- `-l` reads `/proc`: Linux-only and current user only; a TTY is required. `--parallel`
+  agents share the working directory, so fixed-name scratch files there collide.
 - The log panels are memory-bounded, not a faithful copy of the `.log`: lines past 2000
-  characters show `(+N chars)`, only the last 2000 are kept, only the running PR stays
+  characters show `(+N chars)`, only the last 2000 are kept, only running PRs stay
   buffered, and output with no newline for 64KiB is wrapped in the file itself.
 - The usage-limit pattern list is best effort; add new wording to `USAGE_LIMIT_PATTERNS`
   in `config.py` — the consecutive-failure breaker is the safety net behind it.
@@ -193,8 +195,6 @@ dirs** (10 loops, not 10 hours); `MAX_KEPT_LOOP_DIRS` in `store.py` keeps more.
 ## Tests
 
 ```bash
-make test                               # 133 tests, no network
+make test                               # 145 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
-
-`tests/test_config_parity.py` asserts a bash-function `ai_cli` really runs via `bash -ic`.

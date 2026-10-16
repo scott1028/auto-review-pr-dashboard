@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .models import (
     SETTLED_STATES,
     Classification,
@@ -23,7 +25,7 @@ def format_duration(seconds: float | None) -> str:
     return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
-def get_stats(record: LoopRecord | None, now: float) -> dict:
+def get_stats(record: LoopRecord | None, now: float, max_parallel: int = 1) -> dict:
     """Everything the dashboard shows, derived from one loop record."""
     if record is None:
         return {
@@ -74,7 +76,10 @@ def get_stats(record: LoopRecord | None, now: float) -> dict:
         ),
         "elapsed_sec": (record.finished_at or now) - record.started_at,
         "avg_sec": avg_sec,
-        "eta_sec": None if avg_sec is None or not remaining else avg_sec * remaining,
+        # Up to max_parallel PRs run side by side, so they finish in waves.
+        "eta_sec": None
+        if avg_sec is None or not remaining
+        else avg_sec * math.ceil(remaining / max_parallel),
     }
 
 

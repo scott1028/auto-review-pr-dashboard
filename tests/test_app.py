@@ -175,7 +175,7 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
                     "c": "cancel selected PR",
                     "r": "requeue cancelled PR",
                     "n": "skip countdown",
-                    "p": "pause after current PR",
+                    "p": "pause after running PRs",
                     "d": "keep running in background",
                     "l": "toggle agent log",
                     "q": "stop & quit",
@@ -203,7 +203,7 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.paused)
             self.assertEqual(
                 app.screen.active_bindings["p"].binding.description,
-                "pause after current PR",
+                "pause after running PRs",
             )
             self.assertEqual(
                 [
@@ -211,7 +211,7 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
                     for key in app.query_one(Footer).query("FooterKey")
                     if key.key == "p"
                 ],
-                ["pause after current PR"],
+                ["pause after running PRs"],
             )
 
     def test_detail_footer_labels_explain_selected_pr_actions(self):
@@ -289,6 +289,29 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
             app.handle_runner_event("log", ("o/r#15", "second"))
             await pilot.pause()
             self.assertEqual(app._log_buffer, {"o/r#15": ["second"]})
+
+    async def test_log_buffer_keeps_every_running_pr(self):
+        app = self.app
+        async with app.run_test() as pilot:
+            items = [make_item(number, state=PrState.RUNNING) for number in (12, 15)]
+            items.append(make_item(18))
+            self.load_items(app, items)
+            app.handle_runner_event("log", ("o/r#12", "first"))
+            app.handle_runner_event("log", ("o/r#15", "second"))
+            await pilot.pause()
+            # Both agents run side by side, so both keep their live buffer.
+            self.assertEqual(
+                app._log_buffer, {"o/r#12": ["first"], "o/r#15": ["second"]}
+            )
+
+            items[0].state = PrState.DONE
+            items[2].state = PrState.RUNNING
+            app.handle_runner_event("log", ("o/r#18", "third"))
+            await pilot.pause()
+            # The finished PR falls back to its log file.
+            self.assertEqual(
+                app._log_buffer, {"o/r#15": ["second"], "o/r#18": ["third"]}
+            )
 
     async def test_get_log_lines_reads_only_the_tail_of_a_big_log(self):
         lines = [f"line {index:07d}" for index in range(60000)]

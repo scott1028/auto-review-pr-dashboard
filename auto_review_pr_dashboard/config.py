@@ -128,3 +128,4 @@ class RunConfig:
     cooldown_min: int = 30
     dry_run: bool = False
     ai_cli_args: list = field(default_factory=list)
+    max_parallel: int = 1

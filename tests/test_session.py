@@ -133,7 +133,7 @@ class RuntimeMetadataTestCase(unittest.TestCase):
         self.assertIsNone(load_runtime_metadata(self.store))
 
     def test_runtime_metadata_written_before_the_agent_fields_still_loads(self):
-        # A daemon.json from an earlier version has no agent_pgid to read.
+        # A daemon.json from an earlier version has no agent groups to read.
         payload = {
             "protocol_version": PROTOCOL_VERSION,
             "run_id": "run-123",
@@ -144,10 +144,12 @@ class RuntimeMetadataTestCase(unittest.TestCase):
             "config": {},
         }
 
-        metadata = RuntimeMetadata.from_dict(payload)
-
-        self.assertIsNone(metadata.agent_pgid)
-        self.assertIsNone(metadata.agent_start_ticks)
+        self.assertEqual(RuntimeMetadata.from_dict(payload).agent_groups, ())
+        # A daemon that ran one agent at a time recorded a single group.
+        one_agent = payload | {"agent_pgid": 4321, "agent_start_ticks": 99}
+        self.assertEqual(
+            RuntimeMetadata.from_dict(one_agent).agent_groups, ((4321, 99),)
+        )
 
     def test_missing_resume_metadata_does_not_start_daemon(self):
         with (
@@ -282,7 +284,7 @@ class FakeRunner:
         self.blocked_until = None
         self.block_reason = ""
         self.is_recycle_requested = False
-        self._current_key = item.key
+        self.current_key = item.key
         self.commands = []
         self.on_event = on_event
 
@@ -373,6 +375,24 @@ class SessionServerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["current_key"], "o/r#7")
         self.assertFalse(snapshot["paused"])
         self.assertEqual(snapshot["recycle_count"], 0)
+
+    async def test_daemon_json_tracks_every_running_agent_group(self):
+        agents = [
+            subprocess.Popen(["sleep", "60"], start_new_session=True) for _ in range(2)
+        ]
+        for agent in agents:
+            self.addCleanup(kill_agent, agent)
+        self.store.prepare()
+
+        for agent in agents:
+            self.session_server._handle_runner_event("agent_started", (agent.pid,))
+        self.session_server._handle_runner_event("agent_finished", (agents[0].pid,))
+
+        # The finished agent is gone; the one still running stays recorded.
+        self.assertEqual(
+            load_runtime_metadata(self.store).agent_groups,
+            ((agents[1].pid, session.get_process_start_ticks(agents[1].pid)),),
+        )
 
     async def test_paused_tick_carries_the_moved_deadline(self):
         reader, _writer = await self.attach()
@@ -888,13 +908,13 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(session.get_process_start_ticks(agent.pid))
 
-    def _start_over_a_crashed_agent(
+    def _start_over_crashed_agents(
         self, workspace: Path, starttime_offset: int
-    ) -> subprocess.Popen:
-        """Run `start_daemon` while a leftover daemon.json names a live agent group.
+    ) -> list[subprocess.Popen]:
+        """Run `start_daemon` while a leftover daemon.json names two live agent groups.
 
-        `starttime_offset` shifts the recorded starttime: 0 means the group is
-        still the one the crashed daemon knew, anything else is a reused pid.
+        `starttime_offset` shifts the recorded starttimes: 0 means the groups are
+        still the ones the crashed daemon knew, anything else is a reused pid.
         """
         store = Store(workspace / "state")
         store.prepare()
@@ -902,8 +922,11 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
         # run there is no test teardown here, so the lock file gets unlinked.
         lock_path = Path(get_socket_path(workspace)).with_suffix(".lock")
         self.addCleanup(lock_path.unlink, missing_ok=True)
-        agent = subprocess.Popen(["sleep", "60"], start_new_session=True)
-        self.addCleanup(kill_agent, agent)
+        agents = [
+            subprocess.Popen(["sleep", "60"], start_new_session=True) for _ in range(2)
+        ]
+        for agent in agents:
+            self.addCleanup(kill_agent, agent)
         leftover = RuntimeMetadata(
             protocol_version=PROTOCOL_VERSION,
             run_id="crashed-run",
@@ -912,9 +935,10 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
             socket_path=str(get_socket_path(workspace)),
             started_at=123.5,
             config=asdict(RunConfig("codex", "review")),
-            agent_pgid=agent.pid,
-            agent_start_ticks=session.get_process_start_ticks(agent.pid)
-            + starttime_offset,
+            agent_groups=tuple(
+                (agent.pid, session.get_process_start_ticks(agent.pid) + starttime_offset)
+                for agent in agents
+            ),
         )
         get_runtime_path(store).write_text(
             json.dumps(leftover.to_dict()), encoding="utf-8"
@@ -935,8 +959,7 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
                             leftover,
                             run_id="new-run",
                             pid=os.getpid(),
-                            agent_pgid=None,
-                            agent_start_ticks=None,
+                            agent_groups=(),
                         ).to_dict()
                     ),
                     encoding="utf-8",
@@ -955,21 +978,24 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
         ):
             started = start_daemon(RunConfig("codex", "review"), store)
         self.assertEqual(started.run_id, "new-run")
-        return agent
+        return agents
 
     def test_a_crashed_daemons_agent_is_killed_before_the_next_daemon_starts(self):
         original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as temporary_directory:
             os.chdir(temporary_directory)
             try:
-                agent = self._start_over_a_crashed_agent(
+                agents = self._start_over_crashed_agents(
                     Path(temporary_directory), starttime_offset=0
                 )
                 deadline = time.monotonic() + 3
-                while agent.poll() is None and time.monotonic() < deadline:
+                while (
+                    any(agent.poll() is None for agent in agents)
+                    and time.monotonic() < deadline
+                ):
                     time.sleep(0.05)
 
-                self.assertIsNotNone(agent.poll())
+                self.assertTrue(all(agent.poll() is not None for agent in agents))
             finally:
                 os.chdir(original_cwd)
 
@@ -978,13 +1004,13 @@ class DaemonLifecycleTestCase(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             os.chdir(temporary_directory)
             try:
-                agent = self._start_over_a_crashed_agent(
+                agents = self._start_over_crashed_agents(
                     Path(temporary_directory), starttime_offset=1
                 )
                 time.sleep(0.3)
 
-                # The starttime says this pid went to somebody else, so it stays.
-                self.assertIsNone(agent.poll())
+                # The starttimes say these pids went to somebody else, so they stay.
+                self.assertTrue(all(agent.poll() is None for agent in agents))
             finally:
                 os.chdir(original_cwd)
 

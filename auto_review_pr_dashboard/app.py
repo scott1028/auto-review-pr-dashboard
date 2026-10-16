@@ -155,7 +155,7 @@ class Dashboard(Static):
         idle_remaining: float | None,
         block: tuple[str, float] | None = None,
     ) -> None:
-        stats = get_stats(record, time.time())
+        stats = get_stats(record, time.time(), config.max_parallel)
         bar = get_progress_bar(stats["settled"], stats["total"])
         repo_text = get_repo_progress_text(stats["repo_progress"]) or "-"
 
@@ -415,7 +415,7 @@ class AutoReviewPrDashboardApp(App):
         Binding("c", "cancel", "cancel selected PR"),
         Binding("r", "resume", "requeue cancelled PR"),
         Binding("n", "run_now", "skip countdown"),
-        Binding("p", "toggle_pause", "pause after current PR"),
+        Binding("p", "toggle_pause", "pause after running PRs"),
         Binding("p", "resume_queue", "resume queue"),
         Binding("d", "background", "keep running in background"),
         Binding("l", "toggle_activity_log", "toggle agent log"),
@@ -602,9 +602,14 @@ class AutoReviewPrDashboardApp(App):
         if name == "log":
             key, line = payload
             if key not in self._log_buffer:
-                # One agent runs at a time, so only the newest PR needs a buffer;
-                # the others fall back to their log file in get_log_lines().
-                self._log_buffer.clear()
+                # Only running PRs need a buffer; the others fall back to their
+                # log file in get_log_lines().
+                running_keys = set(self.get_running_keys())
+                self._log_buffer = {
+                    buffered_key: lines
+                    for buffered_key, lines in self._log_buffer.items()
+                    if buffered_key in running_keys
+                }
             buffer = self._log_buffer.setdefault(key, [])
             buffer.append(line)
             del buffer[:-MAX_BUFFERED_LOG_LINES]
@@ -864,7 +869,7 @@ class AutoReviewPrDashboardApp(App):
             self.send_session_command("toggle_pause")
         elif self.runner:
             paused = self.runner.toggle_pause()
-            self.notify("paused after the current PR" if paused else "resumed")
+            self.notify("paused after the running PRs" if paused else "resumed")
 
     action_resume_queue = action_toggle_pause
 
@@ -899,7 +904,7 @@ class AutoReviewPrDashboardApp(App):
             if self.session is not None
             else "Quitting stops the review loop as well."
         )
-        return f"Still reviewing {running}; its agent gets killed.\n{tail}"
+        return f"Still reviewing {running}; every running agent gets killed.\n{tail}"
 
     def handle_quit_confirmed(self, confirmed: bool | None) -> None:
         if not confirmed:

@@ -288,12 +288,13 @@ class ConfigParityTest(unittest.TestCase):
         config = parse_args(
             shlex.split(
                 "claude-personal p --repo-url o/r --author me --interval 30 "
-                "--pr-timeout 5 --cooldown 10 --dry-run"
+                "--pr-timeout 5 --cooldown 10 --parallel 3 --dry-run"
             )
         )
         self.assertEqual(config.interval_min, 30)
         self.assertEqual(config.pr_timeout_min, 5)
         self.assertEqual(config.cooldown_min, 10)
+        self.assertEqual(config.max_parallel, 3)
         self.assertTrue(config.dry_run)
 
         config = parse_args(
@@ -341,6 +342,7 @@ class ConfigParityTest(unittest.TestCase):
             "codex p --interval 0 --repo-url o/r --author me",
             "codex p --pr-timeout -1 --repo-url o/r --author me",
             "codex p --cooldown 0 --repo-url o/r --author me",
+            "codex p --parallel 0 --repo-url o/r --author me",
         )
         for argv in cases:
             with self.subTest(argv=argv), self.assertRaises(SystemExit):

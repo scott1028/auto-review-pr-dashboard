@@ -1,7 +1,9 @@
 """Core queue behaviour with no network or real AI agent."""
 
 import asyncio
+import itertools
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -68,7 +70,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
             recycle_every_loops=recycle_every_loops,
         )
 
-    async def run_loop(self, loop_runner, agent_runs=None):
+    async def run_loop(self, loop_runner, agent_runs=None, snapshots=None):
         self.command_calls = []
 
         def command(*args, **kwargs):
@@ -82,7 +84,9 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(gh, "discover_pr_items", return_value=self.items),
-            patch.object(gh, "snapshot_comments", return_value={}),
+            patch.object(
+                gh, "snapshot_comments", side_effect=snapshots or (lambda *a: {})
+            ),
             patch.object(
                 runner.asyncio, "to_thread", side_effect=lambda fn, *a: fn(*a)
             ),
@@ -229,15 +233,15 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started_at, 2)
         self.assertIs(item.state, PrState.FAILED)
         self.assertIn("timed out", item.error)
-        self.assertIsNone(loop_runner._current_process)
+        self.assertEqual(loop_runner._processes, {})
 
     async def test_queued_cancel_resume_moves_item_to_tail_and_preserves_order(self):
         loop_runner = self.make_runner([make_item(1), make_item(2), make_item(3)])
         order = []
 
         async def spawn(*args, **kwargs):
-            order.append(loop_runner._current_key)
-            if loop_runner._current_key == "o/r#1":
+            order.append(kwargs["log_key"])
+            if kwargs["log_key"] == "o/r#1":
                 loop_runner.cancel("o/r#2")
                 item = loop_runner.record.item_by_key("o/r#2")
                 self.assertIs(item.state, PrState.CANCELLED)
@@ -257,7 +261,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         loop_runner = self.make_runner([make_item(1), make_item(2)])
 
         async def cancel():
-            while loop_runner._current_process is None:
+            while not loop_runner._processes:
                 await asyncio.sleep(0.01)
             os.environ["MOCK_SLEEP"] = "0"
             loop_runner.cancel("o/r#1")
@@ -283,7 +287,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         order = []
 
         async def spawn(*args, **kwargs):
-            order.append(loop_runner._current_key)
+            order.append(kwargs["log_key"])
             return next(runs)
 
         record = await self.run_loop(loop_runner, spawn)
@@ -491,9 +495,9 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         agent_pids = []
 
         async def stop_once_started():
-            while loop_runner._current_process is None:
+            while not loop_runner._processes:
                 await asyncio.sleep(0.01)
-            agent_pids.append(loop_runner._current_process.pid)
+            agent_pids.append(loop_runner._processes["o/r#1"].pid)
             loop_runner.stop()
 
         started_at = time.monotonic()
@@ -513,11 +517,11 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         os.environ["MOCK_SLEEP"] = "0.5"
 
         async def stop_three_times_once_started():
-            while loop_runner._current_process is None:
+            while not loop_runner._processes:
                 await asyncio.sleep(0.01)
             # The paths that double up in practice: SIGTERM handler plus "stop"
             # command, or cancel() followed by stop().
-            loop_runner.cancel(loop_runner._current_key)
+            loop_runner.cancel(loop_runner.current_key)
             loop_runner.stop()
             loop_runner.stop()
 
@@ -539,6 +543,9 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(started), 1)
         self.assertGreater(started[0][0], 0)
         self.assertLess(names.index("agent_started"), names.index("agent_finished"))
+        finished = [args for name, args in self.events if name == "agent_finished"]
+        # The daemon tracks several groups, so the finish names its pid.
+        self.assertEqual(finished, started)
 
         # A command that never execs has no process for the daemon to record.
         self.mock_cli = self.mock_cli.parent / "missing-ai"
@@ -578,3 +585,205 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(record.block_events), 4)
         self.assertTrue(all(item.state is PrState.FAILED for item in record.items))
         self.assertIn("giving up", record.items[1].error)
+
+    async def test_failure_with_unknown_posts_is_not_requeued(self):
+        timeout = subprocess.TimeoutExpired("gh", 30)
+        limited = runner.AgentRun(1, ["usage limit"])
+        # Either snapshot failing leaves what the agent posted unknown.
+        for failed_snapshots in (({}, timeout), (timeout, {})):
+            with self.subTest(failed_snapshots=failed_snapshots):
+                self.events.clear()
+                loop_runner = self.make_runner([make_item(1)], cooldown_min=0)
+                snapshots = itertools.chain(failed_snapshots, itertools.repeat({}))
+
+                record = await self.run_loop(
+                    loop_runner, lambda *args, **kwargs: limited, snapshots
+                )
+
+                # A rerun could post the same comments twice.
+                self.assertEqual(len(self.command_calls), 1)
+                self.assertIs(record.items[0].state, PrState.FAILED)
+                self.assertIn("posts unknown", record.items[0].error)
+                self.assertEqual(record.block_events, [])
+
+    def test_failure_after_the_loop_gave_up_logs_no_more_blocks(self):
+        item = make_item(1, state=PrState.RUNNING)
+        item.exit_code = 1
+        loop_runner = self.make_runner([item])
+        loop_runner.record = LoopRecord(1, 0, items=[item])
+        loop_runner.record.block_events = [{}] * (runner.MAX_BLOCKS_PER_LOOP + 1)
+
+        # An agent still running when the 4th block abandoned the loop.
+        loop_runner._handle_failure(item, ["usage limit"], False, "")
+
+        self.assertIs(item.state, PrState.FAILED)
+        self.assertEqual(
+            len(loop_runner.record.block_events), runner.MAX_BLOCKS_PER_LOOP + 1
+        )
+        self.assertNotIn("error", [name for name, _ in self.events])
+
+    async def test_parallel_runs_at_most_max_parallel_agents_at_once(self):
+        loop_runner = self.make_runner(
+            [make_item(number) for number in range(1, 6)], max_parallel=3
+        )
+        running_counts = []
+
+        async def spawn(*args, **kwargs):
+            running_counts.append(len(loop_runner._running_keys))
+            await asyncio.sleep(0.05)
+            return runner.AgentRun(0)
+
+        record = await self.run_loop(loop_runner, spawn)
+
+        self.assertEqual(max(running_counts), 3)
+        self.assertTrue(all(item.state is PrState.DONE for item in record.items))
+
+    async def test_cooldown_starts_no_new_pr_and_lets_running_ones_finish(self):
+        loop_runner = self.make_runner(
+            [make_item(1), make_item(2), make_item(3)],
+            max_parallel=2,
+            cooldown_min=1 / 600,
+        )
+        starts = []
+
+        async def spawn(*args, **kwargs):
+            key = kwargs["log_key"]
+            starts.append(key)
+            if starts == ["o/r#1"]:
+                return runner.AgentRun(1, ["usage limit"])
+            if key == "o/r#2":
+                # Still running when #1 hits the limit.
+                await asyncio.sleep(0.1)
+            return runner.AgentRun(0)
+
+        record = await self.run_loop(loop_runner, spawn)
+
+        self.assertEqual(starts, ["o/r#1", "o/r#2", "o/r#1", "o/r#3"])
+        unblocked_at = [name for name, _ in self.events].index("unblocked")
+        updates = [
+            (index, args[0].key)
+            for index, (name, args) in enumerate(self.events)
+            if name == "item_update"
+        ]
+        # #2 finished inside the cooldown; #3 waited for the cooldown to end.
+        self.assertLess(max(i for i, key in updates if key == "o/r#2"), unblocked_at)
+        self.assertGreater(min(i for i, key in updates if key == "o/r#3"), unblocked_at)
+        self.assertEqual(len(record.block_events), 1)
+        self.assertTrue(all(item.state is PrState.DONE for item in record.items))
+
+    async def test_agents_hitting_the_limit_together_share_one_block(self):
+        items = [make_item(1), make_item(2), make_item(3)]
+        loop_runner = self.make_runner(items, max_parallel=3, cooldown_min=1 / 600)
+        attempts = []
+
+        async def spawn(*args, **kwargs):
+            attempts.append(kwargs["log_key"])
+            attempt = len(attempts)
+            # Let all three start before any of them fails.
+            await asyncio.sleep(0)
+            if attempt <= 3:
+                return runner.AgentRun(1, ["usage limit"])
+            return runner.AgentRun(0)
+
+        record = await self.run_loop(loop_runner, spawn)
+
+        # Three blocks at once would have spent the loop's whole block budget.
+        self.assertEqual(len(record.block_events), 1)
+        self.assertEqual(sorted(attempts), ["o/r#1"] * 2 + ["o/r#2"] * 2 + ["o/r#3"] * 2)
+        self.assertEqual(
+            [(item.state, item.block_attempts) for item in items],
+            [(PrState.DONE, 1)] * 3,
+        )
+
+    async def test_failure_absorbed_by_a_cooldown_does_not_arm_the_breaker(self):
+        items = [make_item(1), make_item(2), make_item(3)]
+        loop_runner = self.make_runner(items, max_parallel=2, cooldown_min=1 / 600)
+        attempts = []
+
+        async def spawn(*args, **kwargs):
+            key = kwargs["log_key"]
+            attempts.append(key)
+            if key == "o/r#1":
+                if attempts.count(key) == 1:
+                    return runner.AgentRun(1, ["usage limit"])
+                await asyncio.sleep(0.05)
+                return runner.AgentRun(0)
+            if key == "o/r#2":
+                if attempts.count(key) == 1:
+                    # Fails inside #1's cooldown, so it is absorbed.
+                    await asyncio.sleep(0.05)
+                # Fails again, alone: one ordinary failure, not two in a row.
+                return runner.AgentRun(3)
+            return runner.AgentRun(0)
+
+        record = await self.run_loop(loop_runner, spawn)
+
+        self.assertEqual(len(record.block_events), 1)
+        self.assertEqual(
+            [(item.state, item.block_attempts) for item in items],
+            [(PrState.DONE, 1), (PrState.FAILED, 1), (PrState.DONE, 0)],
+        )
+
+    async def test_stop_kills_every_running_agent_without_a_block(self):
+        os.environ["MOCK_SLEEP"] = "30"
+        loop_runner = self.make_runner(
+            [make_item(1), make_item(2), make_item(3)], max_parallel=2
+        )
+        agent_pids = []
+
+        async def stop_once_both_started():
+            while len(loop_runner._processes) < 2:
+                await asyncio.sleep(0.01)
+            agent_pids.extend(process.pid for process in loop_runner._processes.values())
+            loop_runner.stop()
+
+        started_at = time.monotonic()
+        stop_task = asyncio.create_task(stop_once_both_started())
+        record = await self.run_loop(loop_runner)
+        await stop_task
+
+        self.assertLess(time.monotonic() - started_at, 5)
+        self.assertEqual(
+            [item.state for item in record.items],
+            [PrState.FAILED, PrState.FAILED, PrState.QUEUED],
+        )
+        # Two kills in a row are `q`, not an outage.
+        self.assertEqual(record.block_events, [])
+        for pid in agent_pids:
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    async def test_stop_before_the_agent_spawns_still_stops_it(self):
+        os.environ["MOCK_SLEEP"] = "30"
+        loop_runner = self.make_runner([make_item(1)])
+
+        async def stop_during_snapshot(item):
+            # `q` lands while the before-snapshot runs, so no process exists yet.
+            loop_runner.stop()
+            return {}
+
+        started_at = time.monotonic()
+        with patch.object(loop_runner, "_snapshot", side_effect=stop_during_snapshot):
+            record = await self.run_loop(loop_runner)
+
+        self.assertLess(time.monotonic() - started_at, 5)
+        self.assertIs(record.items[0].state, PrState.FAILED)
+
+    async def test_cancelling_the_whole_queue_during_a_cooldown_ends_the_loop(self):
+        loop_runner = self.make_runner(
+            [make_item(1), make_item(2)], cooldown_min=5 / 60
+        )
+
+        def cancel_all():
+            loop_runner.cancel("o/r#1")
+            loop_runner.cancel("o/r#2")
+
+        # The queue empties mid-wait; popping it afterwards used to raise.
+        record, _ = await self.run_on_fake_clock(
+            loop_runner, [runner.AgentRun(1, ["usage limit"])], {1: cancel_all}
+        )
+
+        self.assertEqual(
+            [item.state for item in record.items],
+            [PrState.CANCELLED, PrState.CANCELLED],
+        )

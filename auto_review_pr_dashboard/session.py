@@ -52,14 +52,18 @@ class RuntimeMetadata:
     socket_path: str
     started_at: float
     config: dict
-    # The agent group a running daemon owns, so the next start can kill what a
-    # crash left behind. Absent from a daemon.json written before this existed.
-    agent_pgid: int | None = None
-    agent_start_ticks: int | None = None
+    # The agent groups a running daemon owns, as (pgid, start ticks), so the next
+    # start can kill what a crash left behind. Absent from a daemon.json written
+    # before this existed.
+    agent_groups: tuple[tuple[int, int | None], ...] = ()
 
     @classmethod
     def from_dict(cls, payload: dict) -> RuntimeMetadata:
         try:
+            agent_groups = payload.get("agent_groups")
+            if agent_groups is None and payload.get("agent_pgid") is not None:
+                # Written by a daemon that ran one agent at a time.
+                agent_groups = [[payload["agent_pgid"], payload.get("agent_start_ticks")]]
             return cls(
                 protocol_version=int(payload["protocol_version"]),
                 run_id=str(payload["run_id"]),
@@ -68,15 +72,9 @@ class RuntimeMetadata:
                 socket_path=str(payload["socket_path"]),
                 started_at=float(payload["started_at"]),
                 config=dict(payload["config"]),
-                agent_pgid=(
-                    None
-                    if payload.get("agent_pgid") is None
-                    else int(payload["agent_pgid"])
-                ),
-                agent_start_ticks=(
-                    None
-                    if payload.get("agent_start_ticks") is None
-                    else int(payload["agent_start_ticks"])
+                agent_groups=tuple(
+                    (int(pgid), None if start_ticks is None else int(start_ticks))
+                    for pgid, start_ticks in agent_groups or ()
                 ),
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -217,7 +215,7 @@ def _start_daemon_locked(
     # daemon in its own session, and its pid is only in the leftover daemon.json.
     leftover = load_runtime_metadata(store)
     if leftover is not None:
-        _kill_orphan_agent(leftover)
+        _kill_orphan_agents(leftover)
 
     socket_path.unlink(missing_ok=True)
     get_runtime_path(store).unlink(missing_ok=True)
@@ -301,31 +299,38 @@ def get_process_start_ticks(pid: int) -> int | None:
         return None
 
 
-def _kill_orphan_agent(metadata: RuntimeMetadata) -> None:
-    """Kill the agent group a dead daemon left running, if it is still the same one."""
-    if metadata.agent_pgid is None:
-        return
-    pgid = metadata.agent_pgid
-    # A pid can be handed to a new process: the recorded starttime says whether this
-    # group is still the one we knew. A group whose leader is gone keeps its pgid
-    # while any member lives, so a missing starttime match is not a reason to skip.
-    if metadata.agent_start_ticks is not None:
-        start_ticks = get_process_start_ticks(pgid)
-        if start_ticks is not None and start_ticks != metadata.agent_start_ticks:
-            return
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        return
-    deadline = time.monotonic() + TERMINATE_GRACE_SEC
-    while time.monotonic() < deadline:
+def _kill_orphan_agents(metadata: RuntimeMetadata) -> None:
+    """Kill the agent groups a dead daemon left running, if still the same ones."""
+    pgids = []
+    for pgid, agent_start_ticks in metadata.agent_groups:
+        # A pid can be handed to a new process: the recorded starttime says whether
+        # this group is still the one we knew. A group whose leader is gone keeps its
+        # pgid while any member lives, so a missing starttime is no reason to skip.
+        if agent_start_ticks is not None:
+            start_ticks = get_process_start_ticks(pgid)
+            if start_ticks is not None and start_ticks != agent_start_ticks:
+                continue
         try:
-            os.killpg(pgid, 0)
+            os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
-            return
+            continue
+        pgids.append(pgid)
+
+    # One grace period shared by every group, not one each.
+    deadline = time.monotonic() + TERMINATE_GRACE_SEC
+    while True:
+        alive_pgids = []
+        for pgid in pgids:
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(pgid, 0)
+                alive_pgids.append(pgid)
+        pgids = alive_pgids
+        if not pgids or time.monotonic() >= deadline:
+            break
         time.sleep(0.05)
-    with suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGKILL)
+    for pgid in pgids:
+        with suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
 
 
 def _take_start_lock(socket_path: Path) -> TextIOWrapper:
@@ -523,8 +528,8 @@ class SessionServer:
         self.status = "starting"
         self.phase_started_at = self.started_at
         self.recycle_count = 0
-        self.agent_pgid: int | None = None
-        self.agent_start_ticks: int | None = None
+        # pgid -> start ticks of every agent running right now.
+        self.agent_groups: dict[int, int | None] = {}
         if handoff is not None:
             # The loop counter, the countdown and the table carry over from the
             # daemon this one replaces, so the dashboard shows no gap.
@@ -573,8 +578,7 @@ class SessionServer:
             socket_path=str(self.socket_path),
             started_at=self.started_at,
             config=asdict(self.config),
-            agent_pgid=self.agent_pgid,
-            agent_start_ticks=self.agent_start_ticks,
+            agent_groups=tuple(self.agent_groups.items()),
         )
         runtime_path = get_runtime_path(self.store)
         temporary_path = runtime_path.with_suffix(".tmp")
@@ -595,15 +599,13 @@ class SessionServer:
             return
 
         # Recorded in daemon.json only: the dashboard has no use for a pid, and
-        # start_new_session makes the agent its own group leader, so pid is pgid.
+        # start_new_session makes each agent its own group leader, so pid is pgid.
         if name == "agent_started":
-            self.agent_pgid = payload[0]
-            self.agent_start_ticks = get_process_start_ticks(payload[0])
+            self.agent_groups[payload[0]] = get_process_start_ticks(payload[0])
             self._write_runtime_metadata()
             return
         if name == "agent_finished":
-            self.agent_pgid = None
-            self.agent_start_ticks = None
+            self.agent_groups.pop(payload[0], None)
             self._write_runtime_metadata()
             return
 
@@ -651,7 +653,7 @@ class SessionServer:
             "next_run_at": self.runner.next_run_at,
             "blocked_until": self.runner.blocked_until,
             "block_reason": self.runner.block_reason,
-            "current_key": self.runner._current_key,
+            "current_key": self.runner.current_key,
             "phase_started_at": self.phase_started_at,
             "recycle_count": self.recycle_count,
         }
