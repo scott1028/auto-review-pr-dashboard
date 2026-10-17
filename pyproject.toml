@@ -1,5 +1,6 @@
 [project]
 name = "auto-review-pr-dashboard"
+# Bump this and push to master to publish a release (see .github/workflows/release.yml).
 version = "0.1.1"
 description = "A PR review loop whose queue belongs to the dashboard instead of the agent."
 readme = "README.md"
