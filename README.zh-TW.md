@@ -2,12 +2,12 @@
 
 # <img src="docs/icon.png" width="40" alt="" /> auto-review-pr-dashboard
 
-![看板娘:薄荷青橘色機械人專員在控制台前舉著放大鏡](docs/mascot.png)
+![看板娘:薄荷青與橘色的機械人專員,舉著放大鏡,身邊飄著 PR 螢幕](docs/mascot.png)
 
-一個 PR 審查迴圈,佇列歸 dashboard 管、不歸 AI 管:它用 `gh` 找出 PR,每個 PR 開
-**一個 AI process** 去審,所以有進度、有每個 PR 的 log,能取消也能續審;要*怎麼*審,
-永遠由你的 `prompt.md` 決定。把它想成櫃檯:跑腿的 AI 不見了沒關係,櫃檯(daemon)記得
-「還有哪些 PR、審到哪」,你隨時開個新視窗接回來,像根本沒離開過。
+你請 AI 審 PR,可是 AI 自己不記得審到哪裡:視窗一關,進度就跟著不見了。這個工具
+在背景養一個小管家(daemon),進度由它記:還有哪些 PR 要審、哪個審完了、哪個審到
+一半。你開的視窗只是它的螢幕,關掉沒關係,隨時換一個視窗接回來,像根本沒離開過。
+要*怎麼*審,由你的 `prompt.md` 決定;要審*哪些*,由 flag 決定。
 
 ## Install
 
@@ -15,13 +15,14 @@
 make install
 ```
 
-`uv tool install .` 把 `auto-review-pr-dashboard` 執行檔放上 `PATH`,並在
-`~/.bashrc.d/auto-review-pr-dashboard` 留一個 symlink 定義同名 shell function,
-它用 `BASH_FUNC_<name>%%` 把你選的 AI function 匯出去;裝完請開新 shell。每個 PR 跑在
-`bash -ic`(`tests/test_config_parity.py` 會斷言),它先載入 `~/.bashrc` 再叫 `ai_cli`,
-所以 wrapper 被繞過時 `~/.bashrc` 裡的 function 還是用得到——除非 `~/.bashrc` 自己
-定義了同名,那會蓋掉匯出的那份。shell 啟動時印的東西會進 PR log。沒有 uv 也行:
-`pip install .` 加 `python3 -m auto_review_pr_dashboard`。
+`make install` 其實就是 `uv tool install .`:把 `auto-review-pr-dashboard` 放上
+`PATH`,並在 `~/.bashrc.d/auto-review-pr-dashboard` 留一個 symlink,定義一個同名
+shell function,用 `BASH_FUNC_<name>%%` 把你選的 AI function 匯出去,所以裝完請開
+新 shell。每個 PR 的 AI 跑在 `bash -ic` 裡(`tests/test_config_parity.py` 會斷言),
+它先載入 `~/.bashrc` 再叫 `ai_cli`,因此就算 wrapper 被繞過,`~/.bashrc` 裡的
+function 還是用得到——除非 `~/.bashrc` 自己定義了同名,那份會蓋掉匯出的。你的 shell
+啟動時印什麼,PR log 就會看到什麼。沒有 uv 也行:`pip install .` 再用
+`python3 -m auto_review_pr_dashboard`。
 
 | Target | Action |
 |---|---|
@@ -32,13 +33,13 @@ make install
 | `make clean` | 移除 `.venv`、`__pycache__` 與產生的 `requirements.txt` |
 | `make requirements` | 選裝:從 `uv.lock` 產生 pin 好的 `requirements.txt` |
 
-`make uninstall` 在 daemon 還活著時會拒絕(先在 dashboard 按 `q`,或 `FORCE=1`),
-保留 `.tmp/auto-review-pr-dashboard/`,且只有 symlink 還指向這裡時才移除它。
+`make uninstall` 在 daemon 還活著時會拒絕——先在 dashboard 按 `q`,或 `FORCE=1`。
+它保留 `.tmp/auto-review-pr-dashboard/`,且只有 symlink 還指向這裡時才移除它。
 
-[Releases](https://github.com/scott1028/auto-review-pr-dashboard/releases) 有預先打包的
-執行檔:Linux AppImage(`x86_64` / `aarch64`,內含 Python、免 uv;無 FUSE 時命令前加
-`APPIMAGE_EXTRACT_AND_RUN=1`)與 macOS tar.gz(`aarch64` / `x86_64`,解壓後跑
-`bin/auto-review-pr-dashboard`)。
+[Releases](https://github.com/scott1028/auto-review-pr-dashboard/releases) 有預先打包
+的執行檔,不用裝 Python 也不用 uv:Linux 拿 AppImage(`x86_64` / `aarch64`;沒有
+FUSE 時命令前加 `APPIMAGE_EXTRACT_AND_RUN=1`),macOS 拿 tar.gz(`aarch64` /
+`x86_64`,解壓後跑 `bin/auto-review-pr-dashboard`)。
 
 ## Usage
 
@@ -65,26 +66,25 @@ auto-review-pr-dashboard claude --pr-url https://github.com/owner/repo/pull/<n>
 auto-review-pr-dashboard codex --pr-url https://github.com/owner/repo/pull/<n> -- --yolo
 ```
 
-prompt 決定*怎麼審*,flag 決定*審哪些 PR*——範圍永遠不從 prompt 文字推,搜不到的
-條件(「label X 的 PR」)寫在 prompt 裡沒用。`--repo-url` 接受 `owner/repo` 或任何
-git url;餵 PR url 會被擋下並提醒你改用 `--pr-url`;命令前的 inline 環境變數會送到
-`gh` 和 agent。正常啟動會為「呼叫者的工作目錄」拉起一個脫機 daemon 並接上去
-(見 [Architecture](#architecture-tui--ipc--service));`--resume` 要從同一個目錄下、
-要單獨用,會取代之前的 dashboard;daemon 掛掉只會回報、不會自動重啟;`--dry-run`
-一律只在前台。
+一句話:prompt 決定*怎麼審*,flag 決定*審哪些*。範圍永遠不會從 prompt 的文字去猜,
+搜不到的條件(例如「label X 的 PR」)寫在 prompt 裡也沒有用。`--repo-url` 可以給
+`owner/repo` 或任何 git url;餵它 PR 的 url 會被擋下並提醒你改用 `--pr-url`。命令
+前面的 inline 環境變數會送到 `gh` 和 agent。正常啟動會為「你現在的工作目錄」拉起
+一個脫機 daemon 並接上去;`--resume` 要從同一個目錄下、而且要單獨用,它會取代之前的
+dashboard;daemon 掛掉只會回報、不會自動重啟;`--dry-run` 一律只在前台。
 
 ### Prompt 怎麼選
 
-`prompt.md` 在啟動時讀取;不存在就建立,內容剛好是 `code review`。整個檔案就是
-prompt(位置參數的 prompt 會被忽略,空的會被拒),而且永遠不會自動加 skill 呼叫——要加自己加:
+`prompt.md` 在啟動時讀取;不存在就幫你建立,內容剛好是 `code review`。整個檔案就是
+prompt(位置參數的 prompt 會被忽略,空的會被拒)。它永遠不會自動加上 skill 呼叫,
+要加自己加,例如:
 
 ```text
 code review
 /baseline-fe-code-review
-1. Focus on finding bugs.
 ```
 
-系統會附加自動生成的單 PR 範圍;daemon 只讀一次並存檔,改檔案或 `--resume` 都不影響這一輪。
+系統會附加自動生成的單個 PR 範圍;daemon 只讀一次並存檔,改檔案或 `--resume` 不影響這一輪。
 
 ## Keys
 
@@ -110,55 +110,54 @@ code review
 │  render snapshot     │◀────────│   snapshot / log / tick / notice │
 │  keypress → command  │────────▶│   cancel resume run_now pause    │
 └──────────────────────┘  unix   │ runner.py — LoopRunner           │
-    關掉它,什麼都不丟             │   queue, gh, one agent per PR    │
-    --resume 接回來               │ store.py — .tmp/ artifacts       │
-                                  └──────────────────────────────────┘
-                                        └─▶ 每個跑中的 PR 一個 process group: <ai_cli>
+   關掉它,什麼都不丟              │ store.py — .tmp/ artifacts       │
+                                  └────────────────────────────────┴─▶ 每個跑中的 PR 一個 process group: <ai_cli>
 ```
 
-- **審查活得比終端機久。** 一個 PR 可能審 30 分鐘,一輪 loop 好幾小時;若 agent 是
-  終端機的小孩,視窗一關、SSH 一斷就一起死。daemon 用 `start_new_session` 拉起,
-  按 `d` 或關視窗,工作照跑。
-- **審到一半被殺不是免費的。** agent 中途被殺時可能已貼了行內評論但還沒貼收尾
-  marker,下一輪就會重審那個 SHA——詳情頁會告訴你。process 的命,歸持有佇列的那方。
-- **服務不該知道 UI。** `LoopRunner` 只把事件推給 `on_event` callback,
-  所以同一個 class 能在 daemon 下跑、也能對 mock CLI 在 process 內跑。
-- **socket 就是契約,所以 TUI 保持無狀態。** 每次接上先收完整 snapshot,daemon
-  在每次狀態變動推一份,keypress 是一則 `command` 訊息、不是直接呼叫 runner。
-  反壓也在 daemon 端:tick 不推 snapshot,buffer 超過 1 MiB 的 client 直接斷掉。
-- **一個工作目錄一個 daemon,走 unix socket**,在
-  `/tmp/auto-review-pr-dashboard-<uid>/<cwd-hash>.sock`(mode `0700`,旁邊 `.lock` 排隊
-  啟動;每次啟動、recycle、停止都清掉沒人在服的 `.lock`/`.sock` 對)——只在本機、不開
-  port、沒認證,handshake 查 protocol version、run id 和 cwd;同一範圍第二次啟動被拒。
-- **長跑會自己換血。** `run_forever` 在 recycle 時返回,daemon 接住 `.lock`、
-  清空 `.tmp/`、把 loop 狀態從 stdin 交給接班人;TUI 等 `daemon.json` 裡的
-  新 `run_id` 出現再接回去,畫面不丟。
+- **審查活得比你的終端機久。** 一個 PR 可能審 30 分鐘,一輪 loop 跑好幾小時。如果
+  agent 是終端機的小孩,視窗一關、SSH 一斷就一起死;daemon 是用 `start_new_session`
+  拉起的,所以按 `d` 或直接關視窗,工作照跑。
+- **審到一半被殺不是免費的。** agent 可能已貼了行內評論、但還沒貼收尾的 marker,
+  下一輪就會重審同一個 SHA——詳情頁會告訴你。process 的命,歸持有佇列的那方。
+- **服務不該知道 UI。** `LoopRunner` 只把事件推給 `on_event` callback,所以同一個
+  class 能在 daemon 下跑,也能對 mock CLI 在 process 內跑。
+- **socket 就是契約,所以 TUI 保持無狀態。** 每次接上先收到完整 snapshot,之後
+  daemon 在每次狀態變動推一份;按鍵是一則 `command` 訊息,不是直接呼叫 runner。
+  反壓也在 daemon 端:tick 不推 snapshot,buffer 超過 1 MiB 的 client 直接斷線。
+- **一個工作目錄一個 daemon,走 unix socket**:
+  `/tmp/auto-review-pr-dashboard-<uid>/<cwd-hash>.sock`(mode `0700`;旁邊的 `.lock`
+  讓啟動排隊,每次啟動、recycle、停止都會清掉沒人在服的對)——只在本機、不開 port、
+  沒認證;handshake 查 protocol version、run id、cwd;同一範圍第二次啟動會被拒。
+- **長跑會自己換血。** `run_forever` 在 recycle 時返回,daemon 接住 `.lock`、清空
+  `.tmp/`、把 loop 狀態從 stdin 交給接班人;TUI 等 `daemon.json` 出現新 `run_id` 再接回。
 
 ## 每一輪 loop 做什麼
 
-1. **探索** — 每個範圍軸各一次 `gh pr list`(每個 `--author` 一次、每個 reviewer 各
-   `review-requested:` 與 `reviewed-by:` 一次),聯集後去重;GitHub 在同一個 `--search` 裡
-   會 AND 故要分開呼叫。兩範圍都給時,聯集保留「各中其一」的 PR;`--pr-url` 免 `--author`。
-2. **判決** — Draft 或標題 `[WIP]` / `WIP:` 判 `Skip (WIP)`;否則用 `gh pr view
-   --json headRefOid,comments` 和最新一則 `<!-- review-pr-branches: head=<sha> -->` marker
-   決定 `Full` / `Incremental` / `Skip`;`Skip` 還是看得見但不開 agent,只影響顯示與佇列。
-3. **審查** — 剩下的每個 PR 一個 agent,同時最多 `--parallel` 個,指令來自 `prompt.md`。
-4. **Diff** — 每次跑前跑後各快照一次 comment id,「貼了什麼」以 GitHub 為準、
-   不解析 agent 輸出;只有帶這個 skill marker 的評論才算,隊友中途貼的不記帳。
+1. **探索** — 每個範圍軸各呼叫一次 `gh pr list`(每個 `--author` 一次;每個 reviewer
+   各一次 `review-requested:` 與 `reviewed-by:`),取聯集再去重。GitHub 在同一個
+   `--search` 裡會把條件 AND 起來,所以才要分開呼叫。兩種範圍都給時,聯集保留「各中
+   其一」的 PR;`--pr-url` 不需要 `--author`。
+2. **判決** — Draft,或標題有 `[WIP]` / `WIP:`,判 `Skip (WIP)`。否則用 `gh pr view
+   --json headRefOid,comments` 加上最新一則 `<!-- review-pr-branches: head=<sha> -->`
+   marker,決定 `Full` / `Incremental` / `Skip`;`Skip` 的 PR 還是看得見,只是不派 agent。
+3. **審查** — 剩下的每個 PR 派一個 agent,同時最多 `--parallel` 個,指令來自 `prompt.md`。
+4. **Diff** — 每次跑前、跑後各快照一次 comment id;「到底貼了什麼」以 GitHub 為準,
+   不去解析 agent 的輸出。只有帶這個 skill marker 的評論才算,隊友中途貼的不記帳。
 
 ## 當 agent 撞到用量上限
 
 偵測需要一次**失敗**的 run,正常審查不會誤觸:失敗輸出的尾端對上 quota 樣式
-(`usage limit`、`429`、`quota`,…),或不分措辭連續兩次失敗——後者也會抓到登入失效、
-CLI 壞了、網路斷了。該 PR 會以 `queued` 回到佇列**最前**,整輪 loop 停在 banner 後面
-等 `--cooldown` 分鐘,按 `n` 可跳過,免得第一個失敗幾秒後就把剩下的佇列燒光;跑中的
-`--parallel` agents 會跑完,它們的失敗也併進這個區塊。已經貼過評論的 run、或 comment
-快照失敗沒人知道的,會改標 `failed`,因為重跑可能重複貼;cooldown 滿 3 次這輪就放棄、
-等 `--interval`。每次失敗都會把 agent 最後的輸出記進該 PR 的 `error` 欄位。
+(`usage limit`、`429`、`quota`,…),或不分措辭連續失敗兩次——第二種也能抓到登入
+失效、CLI 壞了、網路斷了。那個 PR 會以 `queued` 回到佇列**最前面**,整輪 loop 停在
+banner 後面等 `--cooldown` 分鐘;按 `n` 可跳過等待,免得第一個失敗幾秒後就把剩下的
+佇列燒光。已在跑的 `--parallel` agents 會先跑完,它們的失敗也合併進同一個區塊。
+已經貼過評論的 run、或 comment 快照失敗沒人知道的,會改標 `failed`,因為重跑可能
+重複貼。cooldown 滿 3 次,這一輪就放棄,等 `--interval`。每次失敗都會把 agent
+最後的輸出記進那個 PR 的 `error` 欄位。
 
 ## Artifacts
 
-寫在**呼叫者**的工作目錄下(通常是那個多 repo 的父目錄):
+所有東西寫在**你執行命令的那個**工作目錄下(通常是那個放滿 repo 的父目錄):
 
 ```
 .tmp/auto-review-pr-dashboard/
@@ -169,23 +168,23 @@ CLI 壞了、網路斷了。該 PR 會以 `queued` 回到佇列**最前**,整輪
 └── logs/loop-0003/owner__repo__7.log
 ```
 
-每 `RECYCLE_EVERY_LOOPS` 輪(10,在 `session.py`)整個 `.tmp/` 會刪掉——別的工具放的
-檔案也一起——所以 `loops/` 與 `daemon.log` 不會無限長;狀態列把這些清除計數顯示成
-`cleaned N×`。其間 `logs/` 保留**最新 10 個 loop 目錄**(10 輪,不是 10 小時);要留
-更多改 `store.py` 的 `MAX_KEPT_LOOP_DIRS`。
+每 `RECYCLE_EVERY_LOOPS` 輪(10 輪,常數在 `session.py`)整個 `.tmp/` 會刪掉一次,
+別的工具放的檔案也一起——所以 `loops/` 和 `daemon.log` 不會無限變長;狀態列會把
+這些清除顯示成 `cleaned N×`。其間 `logs/` 保留**最新 10 個 loop 目錄**(10 輪,
+不是 10 小時);想留更多,改 `store.py` 的 `MAX_KEPT_LOOP_DIRS`。
 
 ## Caveats
 
-- daemon 沒清乾淨就死,會留下 agents 繼續跑;下次啟動會從 `daemon.json` 的
+- daemon 沒清乾淨就死,會留下一群 agents 繼續跑;下次啟動會從 `daemon.json` 的
   `agent_groups` 殺掉那些 process group(pid 已被複用的跳過);自己呼叫過 `setsid`
   的後代就管不到了。
-- `-l` 讀 `/proc`:只有 Linux、只有目前使用者;要有 TTY。`--parallel` 的 agents
-  共用工作目錄,放固定檔名的暫存檔會互相撞到。
-- log 面板是記憶體有上限的顯示,不是 `.log` 的忠實拷貝:超過 2000 字元的行顯示
-  `(+N chars)`、只留最後 2000 個字元,只有跑中的 PR 持續 buffer,檔案裡超過
-  64KiB 沒換行的輸出會被硬折。
-- 用量上限的 pattern 清單盡力而為;新措辭請加進 `config.py` 的
-  `USAGE_LIMIT_PATTERNS`——背後的連續失敗斷路器才是安全網。
+- `-l` 是讀 `/proc` 的:只有 Linux、只有目前的使用者;而且要有 TTY。`--parallel`
+  的 agents 共用工作目錄,放固定檔名的暫存檔會互相撞到。
+- log 面板是記憶體有上限的顯示,不是 `.log` 的忠實拷貝:超過 2000 字元的行會顯示
+  `(+N chars)`、只留最後 2000 個字元;只有跑中的 PR 持續 buffer;檔案裡超過 64KiB
+  沒換行的輸出會被硬折。
+- 用量上限的 pattern 清單是盡力而為;看到新措辭請加進 `config.py` 的
+  `USAGE_LIMIT_PATTERNS`——背後的連續失敗斷路器才是真正的安全網。
 
 ## 開發與發布
 
@@ -194,7 +193,8 @@ make test                               # 145 個測試,不連網
 python3 -m unittest discover -s tests   # 同上,不用 uv
 ```
 
-改 `pyproject.toml` 的 `[project].version` 並 push 到 `master`,Release workflow 會比對
-已發布版本、只在更高時發布:跑測試 → 蓋 Linux AppImage(x86_64/aarch64)與 macOS
-bundle(aarch64/x86_64)→ 發 GitHub Release。手動:Actions → Release → Run workflow 可發
-任何版本;tag 是 `v<version>-<commit 前 8 字>`。改版本記得 `uv lock` 並 commit `uv.lock`。
+要發新版:改 `pyproject.toml` 的 `[project].version` 並 push 到 `master`。Release
+workflow 會跟已發布的版本比,只在更高時才發布:跑測試 → 蓋 Linux AppImage
+(x86_64/aarch64)與 macOS bundle(aarch64/x86_64)→ 發 GitHub Release。想手動發:
+Actions → Release → Run workflow 可發任何版本;tag 是 `v<version>-<commit 前 8 字>`。
+改版本記得 `uv lock` 並 commit `uv.lock`。
