@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=auto-review-pr-dashboard
+Comment=PR review loop whose queue belongs to the dashboard
+Exec=auto-review-pr-dashboard
+Icon=auto-review-pr-dashboard
+Terminal=true
+Categories=Development;

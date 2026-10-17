@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+    paths: [pyproject.toml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check release version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          should_release = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          if not should_release:
+              release_pages = json.loads(subprocess.check_output(
+                  ["gh", "api", "--paginate", "--slurp",
+                   f"repos/{os.environ['GITHUB_REPOSITORY']}/releases?per_page=100"],
+                  text=True,
+              ))
+              published_versions = [
+                  tuple(map(int, match.groups()))
+                  for page in release_pages
+                  for release in page
+                  if not release["draft"]
+                  if (match := re.fullmatch(
+                      r"v?([0-9]+)\.([0-9]+)\.([0-9]+)(?:-[0-9a-f]{8})?", release["tag_name"]
+                  ))
+              ]
+              latest_version = max(published_versions, default=None)
+              current_version = tuple(map(int, version.split(".")))
+              should_release = latest_version is None or current_version > latest_version
+              print(f"Current version: {current_version}; highest published version: {latest_version}")
+          else:
+              print("Manual run: publishing without a version check.")
+          tag = f"v{version}-{os.environ['GITHUB_SHA'][:8]}"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"tag={tag}\n")
+              output.write(f"should_release={str(should_release).lower()}\n")
+          PY
+
+  test:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv sync --locked
+      - run: uv run python -m unittest discover -s tests
+
+  build:
+    needs: [prepare, test]
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv build --wheel
+      - name: Prepare recipe
+        run: |
+          recipe="$RUNNER_TEMP/auto-review-pr-dashboard"
+          cp -r packaging/appimage "$recipe"
+          realpath dist/*.whl > "$recipe/requirements.txt"
+          # Pins the bundled dependencies to uv.lock. A constraints file, because python-appimage
+          # passes each requirements.txt line through /bin/sh, which breaks on environment markers.
+          uv export --locked --no-dev --no-emit-project --no-hashes --no-header --no-annotate \
+            > "$RUNNER_TEMP/constraints.txt"
+      - name: Download base Python AppImage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download python3.12 -R niess/python-appimage \
+            -p "python3.12.*-cp312-cp312-manylinux2014_$(uname -m).AppImage" -D "$RUNNER_TEMP/base"
+          # python-appimage runs a local base image as is.
+          chmod +x "$RUNNER_TEMP"/base/*.AppImage
+      - name: Build AppImage
+        env:
+          PIP_CONSTRAINT: ${{ runner.temp }}/constraints.txt
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          uvx --from python-appimage==1.4.6 python-appimage build app \
+            -b "$RUNNER_TEMP"/base/*.AppImage "$RUNNER_TEMP/auto-review-pr-dashboard"
+          appimage="auto-review-pr-dashboard-${RELEASE_TAG#v}-$(uname -m).AppImage"
+          mv "auto-review-pr-dashboard-$(uname -m).AppImage" "$appimage"
+          echo "APPIMAGE=$appimage" >> "$GITHUB_ENV"
+      - name: Smoke test
+        env:
+          # The runner may have no FUSE.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: ./"$APPIMAGE" --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: appimage-${{ matrix.runner }}
+          path: ${{ env.APPIMAGE }}
+          if-no-files-found: error
+
+  build-macos:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.should_release == 'true'
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            arch: aarch64
+          - runner: macos-13
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+      - run: uv build --wheel
+      - name: Download standalone Python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=$(gh api repos/astral-sh/python-build-standalone/releases/latest \
+            --jq '.assets[].browser_download_url' \
+            | grep -E "cpython-3\.12\.[0-9]+(%2B|\+)[0-9]+-${{ matrix.arch }}-apple-darwin-install_only\.tar\.gz$")
+          curl -fsSL "$url" -o python.tar.gz
+          tar xzf python.tar.gz
+      - name: Bundle
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          uv export --locked --no-dev --no-emit-project --no-hashes --no-header --no-annotate \
+            > constraints.txt
+          python/bin/python3 -m pip install --constraint constraints.txt dist/*.whl
+          mkdir -p bundle/bin
+          # Relocatable launcher: the bundled standalone python lives next to bin/.
+          printf '%s\n' '#!/bin/sh' \
+            'DIR=$(cd "$(dirname "$0")/.." && pwd)' \
+            'exec "$DIR/python/bin/python3" -I -m auto_review_pr_dashboard "$@"' \
+            > bundle/bin/auto-review-pr-dashboard
+          chmod +x bundle/bin/auto-review-pr-dashboard
+          mv python bundle/python
+          tar czf "auto-review-pr-dashboard-${RELEASE_TAG#v}-macos-${{ matrix.arch }}.tar.gz" -C bundle .
+      - name: Smoke test
+        run: ./bundle/bin/auto-review-pr-dashboard --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: auto-review-pr-dashboard-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, build, build-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '{appimage,macos}-*'
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          release_error="$RUNNER_TEMP/release-error.txt"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --silent 2>"$release_error"; then
+            gh release upload "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber dist/*
+          elif grep -q '(HTTP 404)' "$release_error"; then
+            gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$RELEASE_TAG" --generate-notes dist/*
+          else
+            cat "$release_error" >&2
+            exit 1
+          fi
