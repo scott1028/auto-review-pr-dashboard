@@ -2,87 +2,143 @@
 
 # auto-review-pr-dashboard guide
 
-[Back to the README](../README.en.md)
+This guide covers the details the [README](../README.en.md) leaves out. For a first run,
+the README is enough; come back here when something goes wrong or you want to know why the
+tool behaves a certain way.
 
-## Install details
+## Glossary
 
-`make install` runs `uv tool install .` to put `auto-review-pr-dashboard` on `PATH`, plus
-a symlink at `~/.bashrc.d/auto-review-pr-dashboard` defining a same-name shell function
-that exports your AI function through `BASH_FUNC_<name>%%`: your `ai_cli` (the AI CLI you
-use, e.g. `codex`) may be a bash function, not a binary. Open a new shell after
-installing.
+| Term | In plain words |
+|---|---|
+| daemon | the caretaker running in the background; it owns the queue and the progress |
+| dashboard / TUI | the screen in your terminal; it's only the daemon's screen, so closing it stops nothing |
+| `ai_cli` | the AI CLI you use. `codex`, `claude`, `pi`, and `opencode` are supported, and so are names with a `-xxx` suffix such as `codex-personal` |
+| agent | the AI process that actually reviews one PR |
+| `prompt.md` | the review instructions for the agent; the whole file is the prompt |
+| round (loop) | one pass: find PRs, then review everything that needs it |
+| marker | a hidden comment the agent leaves on the PR when it finishes, like a bookmark recording which commit was reviewed |
+| `Full` / `Incremental` / `Skip` | this round's call on a PR: never reviewed / reviewed, but the head has moved since / current head already reviewed |
+| cooldown | the time the whole round waits after hitting a usage limit |
+| shift change (recycle) | the daemon periodically hands its work to a fresh daemon |
+| process group | a process plus the child processes it started; they get killed together |
 
-Each PR's AI runs under `bash -ic` (asserted by `tests/test_config_parity.py`), which
-loads `~/.bashrc` before calling `ai_cli`, so its functions work even when the wrapper is
-bypassed. Keep in mind: a same-name definition there shadows the exported one, and
-whatever your shell prints at startup lands in the PR log.
+## What install does
+
+`make install` first runs `uv tool install .`, which puts `auto-review-pr-dashboard` on
+`PATH`. Then it leaves a symlink at `~/.bashrc.d/auto-review-pr-dashboard` that defines a
+shell function of the same name; a new shell is what loads it.
+
+Why the function? Your `ai_cli` may be a bash function rather than a binary. This shell
+function, the wrapper, exports the function you picked through `BASH_FUNC_<name>%%`, so
+the processes the daemon starts can call it.
+
+Each PR's AI runs under `bash -ic` (`tests/test_config_parity.py` checks this). `bash -ic`
+loads `~/.bashrc` before calling `ai_cli`, so a function defined in `~/.bashrc` still
+works even when the wrapper is bypassed. Two things to keep in mind:
+
+- If `~/.bashrc` also defines a function with the same name, it shadows the one the
+  wrapper exported.
+- Whatever your shell prints at startup also shows up in the PR log.
+
+Every make target:
 
 | Target | What it does |
 |---|---|
-| `make` | `uv sync`: dependencies only, into the local `.venv` |
-| `make install` | install the CLI and the shell wrapper |
-| `make uninstall` | remove both, including the daemon socket directory. Refuses while the daemon is alive (press `q` in the dashboard first, or force it with `FORCE=1`); keeps `.tmp/auto-review-pr-dashboard/`; removes the symlink only if it still points at this repo |
-| `make test` | run the tests in the uv environment |
-| `make clean` | remove `.venv`, `__pycache__`, and the generated `requirements.txt` |
-| `make requirements` | optional: generate a pinned `requirements.txt` from `uv.lock` |
-
-## Daemon and socket details
-
-- Slow clients are handled there too: ticks carry no snapshot, and a client buffering over 1 MiB is dropped.
-- (mode `0700`; a `.lock` queues startup, unclaimed `.lock`/`.sock` pairs are cleared on start/recycle/stop); the handshake checks protocol version, run id, cwd;
-- **Long runs change shifts (recycle).** `run_forever` returns at recycle time; the old
-  daemon takes `.lock`, clears `.tmp/`, and hands loop state to its successor via stdin;
-  the TUI waits for a new `run_id` in `daemon.json`, then reattaches.
+| `make` | runs `uv sync`: dependencies only, into the local `.venv` |
+| `make install` | installs the CLI and the shell wrapper |
+| `make uninstall` | removes both, including the daemon socket directory. It refuses while the daemon is running, so press `q` in the dashboard first, or force it with `FORCE=1`. It leaves `.tmp/auto-review-pr-dashboard/` alone, and removes the symlink only if it still points at this repo |
+| `make test` | runs the tests in the uv environment |
+| `make clean` | removes `.venv`, `__pycache__`, and the generated `requirements.txt` |
+| `make requirements` | optional: generates a pinned `requirements.txt` from `uv.lock` |
 
 ## What each loop round does
 
-1. **Discover** — one `gh pr list` call per scope axis (one filter condition): one per
-   `--author`, and per reviewer one each for `review-requested:` and `reviewed-by:`,
-   unioned then deduplicated. GitHub ANDs everything in one `--search`, hence the separate
-   calls; with both scopes, PRs matching either side are kept.
-2. **Decide** — Draft or `[WIP]` / `WIP:` in the title means `Skip (WIP)`. Otherwise
-   `gh pr view --json headRefOid,comments` finds the newest
-   `<!-- review-pr-branches: head=<sha> -->` marker: none means `Full`, a different SHA
-   `Incremental`, the same SHA `Skip`; `Skip` PRs stay visible but never get an agent.
-3. **Review** — one agent per remaining PR, at most `--parallel` at once, per `prompt.md`.
-4. **Diff** — comment ids are snapshotted before and after each run; what was posted comes
-   from GitHub, not from parsing the agent's output. Only comments with this skill's
-   marker count, so teammates posting mid-run aren't recorded.
+Every round follows the same four steps:
+
+1. **Find PRs.** The tool calls `gh pr list` once per search condition: once per
+   `--author`, and for each reviewer once with `review-requested:` and once with
+   `reviewed-by:`. The results are merged and deduplicated. The calls are separate because
+   GitHub ANDs every condition inside one `--search`. If you give both kinds of scope, a
+   PR matching either side is kept.
+2. **Decide whether to review.** A Draft, or a PR with `[WIP]` / `WIP:` in its title,
+   becomes `Skip (WIP)` right away. For the rest, the tool runs
+   `gh pr view --json headRefOid,comments` and finds the newest
+   `<!-- review-pr-branches: head=<sha> -->` marker: no marker means `Full`, a marker SHA
+   that differs from the current head means `Incremental`, and a matching one means
+   `Skip`. `Skip` PRs still show up; they just never get an agent.
+3. **Review.** Each remaining PR gets its own agent, at most `--parallel` at a time,
+   following `prompt.md`.
+4. **Record what was posted.** Before and after each run, the tool snapshots the ids of
+   every comment on the PR; comparing the two shows what's new. This trusts GitHub, not
+   the agent's output. Only comments carrying the `review-pr-branches` marker count, so
+   comments a teammate posts mid-run aren't recorded.
 
 ## When an agent hits a usage limit
 
-Once a usage limit hits, every PR fails fast and the rest of the queue would burn in
-seconds. Detection only looks at **failed** runs, so normal reviews never trip it: a
-failed output's tail matches a quota pattern (`usage limit`, `429`, `quota`, …), or two
-failures in a row regardless of wording, which also catches expired logins, a broken CLI,
-or a dead network.
+Once an agent hits a usage limit, every PR after it fails fast. Without a pause, the rest
+of the queue would burn through in seconds, so the tool detects this and makes the whole
+round stop and wait.
 
-That PR returns to the **front** of the queue as `queued`, and the loop waits behind a
-banner for `--cooldown` minutes; running `--parallel` agents finish and their failures
-join that cooldown. A run that already posted comments, or whose comment snapshot failed
-unnoticed, is marked `failed` instead, since rerunning may duplicate posts.
+Detection only looks at **failed** runs, so a normal review never trips it. Either of
+these counts:
 
-After 3 cooldowns the round gives up and waits for `--interval`. Each failure records the
-agent's last output in that PR's `error` field.
+- The tail of the failed output matches a quota pattern, such as `usage limit`, `429`, or
+  `quota`.
+- Two failures in a row, whatever the error says. This also catches an expired login, a
+  broken CLI, or a dead network.
 
-## Other limits
+After that, the PR goes back to the **front** of the queue as `queued`, and the round
+waits behind a banner for `--cooldown` minutes. Agents already running under `--parallel`
+finish first, and if they fail too, those failures count toward the same cooldown. A few
+special cases:
 
-- A daemon that dies uncleanly leaves its agents running. The next start kills those
-  process groups from `agent_groups` in `daemon.json` (skipping pids that were reused);
-  descendants that called `setsid` themselves are out of reach.
-- The log panel is a memory-bounded view; the full text is in the `.log`. Lines over 2000
-  chars show the first 2000 plus `(+N chars)`; the panel keeps the last 2000 lines, only
-  running PRs buffer, and >64KiB without a newline is hard-wrapped in the file.
+- A run that already posted comments, or whose comment snapshot failed so nobody knows
+  what it posted, is marked `failed` instead of requeued, since a rerun might post
+  duplicates.
+- After 3 cooldowns in one round, the round gives up and waits for the next one,
+  `--interval` later.
+- Every failure records the agent's last output in that PR's `error` field, so you can
+  look at it afterwards.
 
-## Run tests, ship a release
+## Shift changes and the socket
+
+The socket's directory is mode `0700`. A `.lock` next to it makes simultaneous startups
+wait their turn, and every start, shift change (recycle), and stop clears unclaimed
+`.lock`/`.sock` pairs.
+
+When the TUI attaches, it first does a handshake, a quick check that both sides belong
+together: the daemon compares the protocol version, run id, and cwd, and accepts only if
+all three match. Slow clients are the daemon's job too: the once-a-second tick carries no
+snapshot, and the daemon drops any client whose buffer passes 1 MiB.
+
+At a shift change, `run_forever` returns. The old daemon takes `.lock`, clears `.tmp/`,
+and hands the loop state to its successor via stdin. The TUI waits for a new `run_id` in
+`daemon.json`, then reattaches on its own.
+
+## Limits and edge cases
+
+- If the daemon dies without cleaning up, its agents keep running. On the next start, the
+  tool kills those process groups using `agent_groups` in `daemon.json`, skipping any pid
+  that another process has since reused. A descendant that called `setsid` itself is out
+  of reach.
+- The log panel is an in-memory view with limits; the full text is in the `.log` file. A
+  line over 2000 characters shows only its first 2000, followed by `(+N chars)`.
+- The panel keeps the last 2000 lines, and only running PRs keep buffering. In the `.log`
+  file, output that runs past 64KiB without a newline gets hard-wrapped into several
+  lines.
+
+## Tests and releases
 
 ```bash
 make test                               # 145 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
 
-To ship a release, bump `[project].version` in `pyproject.toml` and push to `master`; the
-Release workflow publishes only when that beats every published version: tests → Linux
-AppImages (x86_64/aarch64) + macOS bundles (aarch64/x86_64) → GitHub Release. By hand:
-Actions → Release → Run workflow, no version check; tag
-`v<version>-<first 8 chars of commit>`. When bumping, run `uv lock` and commit `uv.lock`.
+To ship a release, bump `[project].version` in `pyproject.toml` and push to `master`. The
+Release workflow compares it against every published version and publishes only if it's
+higher: tests → Linux AppImages (x86_64/aarch64) + macOS bundles (aarch64/x86_64) → GitHub
+Release.
+
+To publish by hand, go to Actions → Release → Run workflow; that skips the version check.
+The tag looks like `v<version>-<first 8 chars of commit>`. When you bump the version, run
+`uv lock` and commit `uv.lock` too.
