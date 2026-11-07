@@ -157,8 +157,8 @@ python3 -m unittest discover -s tests   # same, without uv
 
 To ship a release, bump `[project].version` in `pyproject.toml` and push to `master`. The
 Release workflow compares it against every published version and publishes only if it's
-higher: tests → Linux AppImages (x86_64/aarch64) + macOS bundles (aarch64/x86_64) → GitHub
-Release.
+higher: tests → Linux AppImages (x86_64/aarch64) +
+a macOS bundle (aarch64) → GitHub Release.
 
 To publish by hand, go to Actions → Release → Run workflow; that skips the version check.
 The tag looks like `v<version>-<first 8 chars of commit>`. When you bump the version, run

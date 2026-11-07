@@ -42,11 +42,13 @@ other make targets, are in the guide under
 No uv? Run `pip install .`, then start the tool with
 `python3 -m auto_review_pr_dashboard`. Don't want Python at all?
 [Releases](https://github.com/scott1028/auto-review-pr-dashboard/releases) has prebuilt
-binaries for both `x86_64` and `aarch64`:
+binaries:
 
-- Linux: an AppImage. If your system has no FUSE (the AppImage uses it to mount itself),
-  put `APPIMAGE_EXTRACT_AND_RUN=1` in front of the command.
-- macOS: a tar.gz. Unpack it and run `bin/auto-review-pr-dashboard`.
+- Linux: an AppImage, for both `x86_64` and `aarch64`. If your system has no FUSE (the
+  AppImage uses it to mount itself), put `APPIMAGE_EXTRACT_AND_RUN=1` in front of the
+  command.
+- macOS: a tar.gz, for Apple Silicon (`aarch64`) only. Unpack it and run
+  `bin/auto-review-pr-dashboard`.
 
 ## Start reviewing PRs
 

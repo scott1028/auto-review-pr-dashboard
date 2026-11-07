@@ -138,7 +138,8 @@ python3 -m unittest discover -s tests   # 同上,不用 uv
 
 要發新版，改 `pyproject.toml` 的 `[project].version`，然後 push 到 `master`。Release
 workflow 會拿它跟已經發布過的版本比，只有比較高才會發布，流程是：跑測試 → 打包 Linux
-AppImage（x86_64/aarch64）和 macOS bundle（aarch64/x86_64）→ 發 GitHub Release。
+AppImage（x86_64/aarch64）和
+macOS bundle（aarch64）→ 發 GitHub Release。
 
 想手動發的話，到 Actions → Release → Run workflow，這樣不會檢查版本。tag 的格式是
 `v<version>-<commit 前 8 字>`。改版本時記得跑 `uv lock`，並把 `uv.lock` 一起 commit。

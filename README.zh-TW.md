@@ -37,11 +37,11 @@ make install
 沒有 uv 的話，先 `pip install .`，再用 `python3 -m auto_review_pr_dashboard` 跑。連 Python
 都不想裝，可以到
 [Releases](https://github.com/scott1028/auto-review-pr-dashboard/releases)
-下載打包好的執行檔，`x86_64` 和 `aarch64` 都有：
+下載打包好的執行檔：
 
-- Linux 用 AppImage。系統沒有 FUSE 的話（AppImage 靠它把自己掛載起來），在命令前面加上
-  `APPIMAGE_EXTRACT_AND_RUN=1`。
-- macOS 用 tar.gz，解開後執行 `bin/auto-review-pr-dashboard`。
+- Linux 用 AppImage，`x86_64` 和 `aarch64` 都有。系統沒有 FUSE 的話（AppImage 靠它把自己
+  掛載起來），在命令前面加上 `APPIMAGE_EXTRACT_AND_RUN=1`。
+- macOS 用 tar.gz（只有 Apple Silicon），解開後執行 `bin/auto-review-pr-dashboard`。
 
 ## 開始審 PR
 
