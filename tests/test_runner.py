@@ -3,6 +3,7 @@
 import asyncio
 import itertools
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,12 +14,24 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from auto_review_pr_dashboard import gh, runner
+from auto_review_pr_dashboard import gate, runner
 from auto_review_pr_dashboard.config import RunConfig
-from auto_review_pr_dashboard.models import LoopRecord, PrItem, PrState
+from auto_review_pr_dashboard.discover import (
+    DiscoveredPr,
+    DiscoverError,
+    parse_discover_output,
+)
+from auto_review_pr_dashboard.models import (
+    LoopRecord,
+    PrItem,
+    PrState,
+    SkipReason,
+    Verdict,
+)
 from auto_review_pr_dashboard.store import Store
 
 HEAD = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+OLD_HEAD = "9999999999999999999999999999999999999999"
 MOCK_CLI = """#!/usr/bin/env python3
 import os, sys, time
 print(sys.argv[-1], flush=True)
@@ -37,6 +50,55 @@ def make_item(number, repo="o/r", state=PrState.QUEUED):
         HEAD,
         state=state,
     )
+
+
+def make_found(number, skip_reason=None, matched_axes=("author:me",)):
+    return DiscoveredPr(
+        "o/r",
+        number,
+        f"https://github.com/o/r/pull/{number}",
+        OLD_HEAD,
+        skip_reason,
+        list(matched_axes),
+    )
+
+
+def make_snapshot(marker_sha=None, title="pr title"):
+    return gate.GateSnapshot(title, "me", HEAD, marker_sha)
+
+
+def kill_group(pgid):
+    """Cleanup for a test's own process group, whether or not it is still there."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+class FakeLogFile:
+    """Log stand-in that fails like a full disk."""
+
+    def __init__(self, fail_writes_after=None, fail_close=False):
+        self.text = []
+        self.fail_writes_after = fail_writes_after
+        self.fail_close = fail_close
+        self.writes = 0
+
+    def _raise_if_full(self):
+        if self.fail_writes_after is not None and self.writes > self.fail_writes_after:
+            raise OSError(28, "No space left on device")
+
+    def write(self, text):
+        self.writes += 1
+        self._raise_if_full()
+        self.text.append(text)
+
+    def flush(self):
+        self._raise_if_full()
+
+    def close(self):
+        if self.fail_close:
+            raise OSError(28, "No space left on device")
 
 
 class FakeTime:
@@ -59,6 +121,8 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.mock_cli.chmod(0o755)
         self.store = Store(Path(tmp.name) / "state")
         self.events = []
+        # When set, the agent is this bash script instead of the mock CLI.
+        self.agent_script = None
 
     def make_runner(self, items, recycle_every_loops=None, **overrides):
         config = RunConfig("codex-test-stub", "review", repos=["o/r"], **overrides)
@@ -75,6 +139,9 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
 
         def command(*args, **kwargs):
             self.command_calls.append((args, kwargs))
+            if self.agent_script is not None:
+                # bash -c, not -ic: an interactive bash would load ~/.bashrc
+                return ["bash", "-c", self.agent_script]
             return [str(self.mock_cli), "--flag", args[-1]]
 
         spawn_patch = (
@@ -82,10 +149,27 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
             if agent_runs is None
             else patch.object(loop_runner, "_spawn_agent", side_effect=agent_runs)
         )
+        found = [
+            DiscoveredPr(item.repo, item.number, item.url, item.head_sha)
+            for item in self.items
+        ]
+        # A marker on the head is how a PR comes out as a Skip.
+        gate_snapshots = {
+            item.url: gate.GateSnapshot(
+                item.title,
+                item.author,
+                item.head_sha,
+                item.head_sha if item.state is PrState.SKIP else None,
+            )
+            for item in self.items
+        }
         with (
-            patch.object(gh, "discover_pr_items", return_value=self.items),
+            patch.object(runner, "discover_prs", return_value=found),
             patch.object(
-                gh, "snapshot_comments", side_effect=snapshots or (lambda *a: {})
+                gate, "get_gate_snapshot", side_effect=gate_snapshots.__getitem__
+            ),
+            patch.object(
+                gate, "snapshot_comments", side_effect=snapshots or (lambda *a: {})
             ),
             patch.object(
                 runner.asyncio, "to_thread", side_effect=lambda fn, *a: fn(*a)
@@ -94,6 +178,334 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
             spawn_patch,
         ):
             return await loop_runner.run_loop()
+
+    def agent_pgids(self):
+        return [args[0] for name, args in self.events if name == "agent_started"]
+
+    async def wait_for_agents(self, count=1):
+        while len(self.agent_pgids()) < count:
+            await asyncio.sleep(0.01)
+
+    async def assert_group_dead(self, pgid, within=3.0):
+        deadline = time.monotonic() + within
+        while runner.get_is_group_alive(pgid) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        self.assertFalse(runner.get_is_group_alive(pgid), f"group {pgid} still alive")
+
+    def patch_log_open(self, fake_log):
+        # runner calls the builtin `open`; a module global shadows it
+        return patch.object(runner, "open", create=True, return_value=fake_log)
+
+    async def test_timeout_kills_group_of_term_ignoring_agent(self):
+        # bash shrugs off TERM, but the child sleep must die with the group
+        self.agent_script = 'trap "" TERM; sleep 30 & wait'
+        loop_runner = self.make_runner([make_item(1)], pr_timeout_min=1 / 60)
+        started = time.monotonic()
+        record = await self.run_loop(loop_runner)
+        elapsed = time.monotonic() - started
+
+        self.assertIs(record.items[0].state, PrState.FAILED)
+        self.assertIn("timed out", record.items[0].error)
+        # the grace period ends in SIGKILL: without it this waits out the sleep
+        self.assertLess(elapsed, 12)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_agent_that_closes_stdout_still_times_out(self):
+        # the timeout belongs to the process, not to its output
+        self.agent_script = "exec 1>&-; sleep 5"
+        loop_runner = self.make_runner([make_item(1)], pr_timeout_min=1 / 60)
+        record = await self.run_loop(loop_runner)
+
+        self.assertIs(record.items[0].state, PrState.FAILED)
+        self.assertIn("timed out", record.items[0].error)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_detached_child_does_not_delay_completion(self):
+        # the child holds the pipe open; the leader's exit still settles the PR
+        self.agent_script = "sleep 9 & exit 0"
+        started = time.monotonic()
+        record = await self.run_loop(self.make_runner([make_item(1)]))
+
+        self.assertIs(record.items[0].state, PrState.DONE)
+        self.assertLess(time.monotonic() - started, 4)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_detached_child_on_closed_pipe_leaves_no_group(self):
+        # the child holds no pipe, so nothing blocks the pump: only an
+        # unconditional SIGKILL at the end of the drain clears it
+        self.agent_script = "sleep 9 >/dev/null 2>&1 & exit 0"
+        started = time.monotonic()
+        record = await self.run_loop(self.make_runner([make_item(1)]))
+
+        self.assertIs(record.items[0].state, PrState.DONE)
+        self.assertLess(time.monotonic() - started, 4)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_cancel_running_agent_kills_group_quickly(self):
+        self.agent_script = "sleep 30"
+        loop_runner = self.make_runner([make_item(1)])
+        task = asyncio.create_task(self.run_loop(loop_runner))
+        await self.wait_for_agents()
+        started = time.monotonic()
+        self.assertTrue(loop_runner.cancel("o/r#1"))
+        record = await task
+
+        self.assertIs(record.items[0].state, PrState.CANCELLED)
+        self.assertLess(time.monotonic() - started, 3)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_cancel_in_the_post_run_window_is_refused(self):
+        loop_runner = self.make_runner([make_item(1)])
+        snapshot_calls = []
+        results = []
+
+        def snapshots(repo, number):
+            snapshot_calls.append(number)
+            if len(snapshot_calls) == 2:
+                # The post-run snapshot: the agent is gone already.
+                results.append(loop_runner.cancel(f"{repo}#{number}"))
+            return {}
+
+        record = await self.run_loop(loop_runner, snapshots=snapshots)
+
+        self.assertEqual(results, [False])
+        # the normal decision stands, unchanged by the refused cancel
+        self.assertIs(record.items[0].state, PrState.DONE)
+        self.assertEqual(record.items[0].error, "")
+
+    async def test_cancel_while_the_output_drains_is_refused(self):
+        # the leader exits at once; the child keeps the pipe open for a while
+        self.agent_script = "(sleep 1; echo late) & exit 0"
+        loop_runner = self.make_runner([make_item(1)])
+        task = asyncio.create_task(self.run_loop(loop_runner))
+        await self.wait_for_agents()
+        while loop_runner._processes["o/r#1"].returncode is None:
+            await asyncio.sleep(0.01)
+
+        self.assertFalse(loop_runner.cancel("o/r#1"))
+        record = await task
+        self.assertIs(record.items[0].state, PrState.DONE)
+
+    async def test_cancelled_agent_task_kills_the_group_at_once(self):
+        # TERM is ignored, so only the guard's synchronous SIGKILL ends it
+        loop_runner = self.make_runner([])
+        task = asyncio.create_task(
+            loop_runner._spawn_agent(
+                ["bash", "-c", "trap '' TERM; sleep 30"],
+                self.mock_cli.parent / "agent.log",
+                60,
+                "o/r#1",
+            )
+        )
+        await self.wait_for_agents()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.assert_group_dead(self.agent_pgids()[0], within=1.0)
+
+    async def test_a_requeued_pr_starts_without_its_last_finish_time(self):
+        loop_runner = self.make_runner([make_item(1)], cooldown_min=1 / 600)
+        runs = iter((runner.AgentRun(1, ["usage limit"]), runner.AgentRun(0)))
+        seen = []
+
+        async def spawn(*args, **kwargs):
+            item = loop_runner.record.item_by_key("o/r#1")
+            seen.append((item.finished_at, item.exit_code))
+            return next(runs)
+
+        record = await self.run_loop(loop_runner, spawn)
+
+        # the cooldown put it back after a finished run; this run starts clean
+        self.assertEqual(seen, [(None, None), (None, None)])
+        self.assertIs(record.items[0].state, PrState.DONE)
+
+    async def test_stop_process_waits_for_the_whole_group(self):
+        # The leader dies on TERM; its child ignores TERM and holds no pipe, so
+        # the leader's exit says nothing about the group.
+        loop_runner = self.make_runner([])
+        process = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            "(trap '' TERM; echo ready; exec sleep 30 >/dev/null 2>&1) & wait",
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.addCleanup(kill_group, process.pid)
+        await process.stdout.readline()  # the child ignores TERM from here on
+
+        with patch.object(runner, "TERMINATE_GRACE_SEC", 0.5):
+            await loop_runner._stop_process(process)
+
+        # SIGKILL lands and the child is reaped asynchronously, so allow a
+        # moment; a child left alive would sleep on for 30s.
+        await self.assert_group_dead(process.pid, within=1.0)
+        await process.wait()
+
+    async def test_agent_started_event_error_leaves_no_group(self):
+        self.agent_script = "sleep 30"
+        loop_runner = self.make_runner([make_item(1)])
+
+        def broken_listener(name, *args):
+            self.events.append((name, args))
+            if name == "agent_started":
+                raise RuntimeError("ui is broken")
+
+        loop_runner.on_event = broken_listener
+        with self.assertRaises(RuntimeError):
+            await self.run_loop(loop_runner)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_cancel_run_loop_task_leaves_no_group(self):
+        self.agent_script = "sleep 30"
+        loop_runner = self.make_runner([make_item(1)])
+        task = asyncio.create_task(self.run_loop(loop_runner))
+        await self.wait_for_agents()
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_cancel_race_skips_spawn(self):
+        loop_runner = self.make_runner([])
+        item = make_item(1)
+        loop_runner.record = LoopRecord(index=1, started_at=time.time(), items=[item])
+        loop_runner._cancelled_keys.add("o/r#1")
+        with (
+            patch.object(gate, "snapshot_comments", return_value={}),
+            patch.object(loop_runner, "_spawn_agent", AsyncMock()) as spawn_agent,
+        ):
+            await loop_runner._run_item(item)
+
+        self.assertIs(item.state, PrState.CANCELLED)
+        self.assertIsNone(item.started_at)
+        spawn_agent.assert_not_called()
+        self.assertIn("item_update", [name for name, _ in self.events])
+
+    async def test_cancel_during_the_pre_run_snapshot_spawns_nothing(self):
+        loop_runner = self.make_runner([make_item(1), make_item(2)])
+        snapshot_started = asyncio.Event()
+        release_snapshot = asyncio.Event()
+        snapshot_keys = []
+
+        async def held_snapshot(item):
+            snapshot_keys.append(item.key)
+            if len(snapshot_keys) == 1:
+                # PR 1's pre-run snapshot: hold it until the cancel is in.
+                snapshot_started.set()
+                await release_snapshot.wait()
+            return {}
+
+        with patch.object(loop_runner, "_snapshot", new=held_snapshot):
+            task = asyncio.create_task(self.run_loop(loop_runner))
+            await snapshot_started.wait()
+            self.assertTrue(loop_runner.cancel("o/r#1"))
+            release_snapshot.set()
+            record = await task
+
+        first, second = record.items
+        self.assertIs(first.state, PrState.CANCELLED)
+        self.assertEqual(first.error, "cancelled by user")
+        self.assertFalse(Path(first.log_path).exists())
+        # Only PR 2 ever got an agent.
+        self.assertEqual([args[3] for args, _ in self.command_calls], [second.url])
+        self.assertEqual(len(self.agent_pgids()), 1)
+        self.assertEqual(loop_runner._running_keys, [])
+        self.assertIsNone(loop_runner.current_key)
+        self.assertIs(second.state, PrState.DONE)
+
+    async def test_three_way_cancel_race_parallel_two(self):
+        self.agent_script = "sleep 30"
+        loop_runner = self.make_runner(
+            [make_item(number) for number in (1, 2, 3)], max_parallel=2
+        )
+        task = asyncio.create_task(self.run_loop(loop_runner))
+        await self.wait_for_agents(2)  # #1 #2 running, #3 queued
+        started = time.monotonic()
+        for key in ("o/r#2", "o/r#3", "o/r#1"):
+            self.assertTrue(loop_runner.cancel(key))
+        record = await task
+
+        self.assertEqual(
+            [item.state for item in record.items], [PrState.CANCELLED] * 3
+        )
+        self.assertLess(time.monotonic() - started, 4)
+        for pgid in self.agent_pgids():
+            await self.assert_group_dead(pgid)
+
+    async def test_loop_index_continues_after_restart(self):
+        self.store.save_state(RunConfig("codex-test-stub", "review"), 41)
+        loop_runner = self.make_runner([])
+        self.assertEqual(loop_runner.loop_index, 41)
+
+        record = await self.run_loop(loop_runner)
+
+        self.assertEqual(record.index, 42)
+        self.assertTrue((self.store.loops_dir / "loop-0042.json").is_file())
+
+    async def test_full_log_fails_only_that_pr(self):
+        loop_runner = self.make_runner([make_item(1), make_item(2)])
+        real_get_log_path = self.store.get_log_path
+
+        def log_path_for(loop_index, item):
+            if item.number == 1:
+                return Path("/dev/full")
+            return real_get_log_path(loop_index, item)
+
+        with patch.object(self.store, "get_log_path", side_effect=log_path_for):
+            record = await self.run_loop(loop_runner)
+
+        first, second = record.items
+        self.assertIs(first.state, PrState.FAILED)
+        self.assertIn("log", first.error)
+        self.assertIs(second.state, PrState.DONE)
+        self.assertIn("loop_end", [name for name, _ in self.events])
+        for pgid in self.agent_pgids():
+            await self.assert_group_dead(pgid)
+
+    async def test_log_write_failure_after_clean_exit_is_not_done(self):
+        self.agent_script = "echo hi; exit 0"
+        with self.patch_log_open(FakeLogFile(fail_writes_after=1)):
+            item = (await self.run_loop(self.make_runner([make_item(1)]))).items[0]
+
+        self.assertIs(item.state, PrState.FAILED)
+        self.assertIn("writing log failed", item.error)
+        self.assertNotEqual(item.exit_code, 0)
+
+    async def test_log_write_failure_during_the_drain_is_not_done(self):
+        # the leader exits 0 first; the child writes later, so the log only
+        # breaks while the output is being drained
+        self.agent_script = "(sleep 0.3; echo late) & exit 0"
+        with self.patch_log_open(FakeLogFile(fail_writes_after=1)):
+            item = (await self.run_loop(self.make_runner([make_item(1)]))).items[0]
+
+        self.assertIs(item.state, PrState.FAILED)
+        self.assertIn("writing log failed", item.error)
+        self.assertNotEqual(item.exit_code, 0)
+        await self.assert_group_dead(self.agent_pgids()[0])
+
+    async def test_log_close_failure_after_clean_exit_is_not_done(self):
+        self.agent_script = "exit 0"
+        with self.patch_log_open(FakeLogFile(fail_close=True)):
+            item = (await self.run_loop(self.make_runner([make_item(1)]))).items[0]
+
+        self.assertIs(item.state, PrState.FAILED)
+        self.assertIn("closing the log failed", item.error)
+        self.assertNotEqual(item.exit_code, 0)
+
+    async def test_discovery_failure_is_a_loop_level_error(self):
+        for failure in (
+            DiscoverError("pr-discover exited 1: boom"),
+            gate.GhError("gh not found on PATH"),
+        ):
+            with self.subTest(failure=failure):
+                self.events.clear()
+                loop_runner = self.make_runner([])
+                with patch.object(runner, "discover_prs", side_effect=failure):
+                    record = await loop_runner.run_loop()
+
+                self.assertEqual(record.items, [])
+                self.assertIn(("error", (f"discovery failed: {failure}",)), self.events)
+                self.assertIn("loop_end", [name for name, _ in self.events])
 
     async def test_prompt_is_forwarded_to_each_agent(self):
         loop_runner = self.make_runner([make_item(1)], ai_cli_args=["--yolo"])
@@ -152,15 +564,16 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         return record, observations
 
     async def test_happy_path_runs_queue_and_persists_progress_and_logs(self):
-        skip = make_item(2, state=PrState.SKIP)
         record = await self.run_loop(
-            self.make_runner([make_item(1), skip, make_item(3)])
+            self.make_runner(
+                [make_item(1), make_item(2, state=PrState.SKIP), make_item(3)]
+            )
         )
         self.assertEqual(
             [item.state for item in record.items],
             [PrState.DONE, PrState.SKIP, PrState.DONE],
         )
-        self.assertIsNone(skip.started_at)
+        self.assertIsNone(record.items[1].started_at)
         self.assertEqual(runner.get_progress(record), (3, 3))
         self.assertEqual(record.repo_progress(), {"o/r": (3, 3)})
         self.assertTrue((self.store.loops_dir / "loop-0001.json").is_file())
@@ -561,8 +974,9 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         loop_runner = self.make_runner(items, cooldown_min=0)
         runs = iter((runner.AgentRun(3), runner.AgentRun(3), runner.AgentRun(0)))
         record = await self.run_loop(loop_runner, runs)
-        self.assertIs(items[0].state, PrState.FAILED)
-        self.assertEqual((items[1].state, items[1].block_attempts), (PrState.DONE, 1))
+        first, second = record.items
+        self.assertIs(first.state, PrState.FAILED)
+        self.assertEqual((second.state, second.block_attempts), (PrState.DONE, 1))
         self.assertIn("2 failures", record.block_events[0]["reason"])
 
     def test_failure_after_posting_is_not_requeued(self):
@@ -691,7 +1105,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(record.block_events), 1)
         self.assertEqual(sorted(attempts), ["o/r#1"] * 2 + ["o/r#2"] * 2 + ["o/r#3"] * 2)
         self.assertEqual(
-            [(item.state, item.block_attempts) for item in items],
+            [(item.state, item.block_attempts) for item in record.items],
             [(PrState.DONE, 1)] * 3,
         )
 
@@ -720,7 +1134,7 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(record.block_events), 1)
         self.assertEqual(
-            [(item.state, item.block_attempts) for item in items],
+            [(item.state, item.block_attempts) for item in record.items],
             [(PrState.DONE, 1), (PrState.FAILED, 1), (PrState.DONE, 0)],
         )
 
@@ -786,4 +1200,167 @@ class RunnerTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [item.state for item in record.items],
             [PrState.CANCELLED, PrState.CANCELLED],
+        )
+
+
+class BuildItemsTest(unittest.TestCase):
+    """One loop's items: pr-discover's skips first, then the head marker."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = Store(Path(tmp.name) / "state")
+        self.events = []
+
+    def build_items(self, found, snapshots):
+        """`snapshots` holds one get_gate_snapshot result or error per PR."""
+        loop_runner = runner.LoopRunner(
+            RunConfig("codex-test-stub", "review", repos=["o/r"]),
+            self.store,
+            lambda name, *args: self.events.append((name, args)),
+        )
+        with (
+            patch.object(runner, "discover_prs", return_value=found),
+            patch.object(
+                gate, "get_gate_snapshot", side_effect=snapshots
+            ) as get_gate_snapshot,
+        ):
+            items = loop_runner.build_items()
+        self.snapshot_urls = [
+            call.args[0] for call in get_gate_snapshot.call_args_list
+        ]
+        return items
+
+    def test_marker_decides_the_verdict_in_discovery_order(self):
+        items = self.build_items(
+            [make_found(12), make_found(15), make_found(7)],
+            [make_snapshot(), make_snapshot(OLD_HEAD), make_snapshot(HEAD)],
+        )
+
+        self.assertEqual([item.key for item in items], ["o/r#12", "o/r#15", "o/r#7"])
+        self.assertEqual(
+            [item.verdict for item in items],
+            [Verdict.FULL, Verdict.INCREMENTAL, Verdict.SKIP],
+        )
+        self.assertEqual(
+            [item.state for item in items],
+            [PrState.QUEUED, PrState.QUEUED, PrState.SKIP],
+        )
+        self.assertEqual(
+            [item.skip_reason for item in items],
+            [None, None, SkipReason.HEAD_ALREADY_REVIEWED],
+        )
+        self.assertEqual(
+            [item.last_marker_sha for item in items], [None, OLD_HEAD, HEAD]
+        )
+
+    def test_unchanged_from_pr_discover_still_gets_a_marker_verdict(self):
+        found = parse_discover_output(
+            '{"prs": [{"key": "o/r#1", "url": "u1", "head_sha": "abc", '
+            '"action": "skipped", "reason": "unchanged"}]}'
+        )
+        item = self.build_items(found, [make_snapshot()])[0]
+
+        self.assertIs(item.verdict, Verdict.FULL)
+        self.assertIs(item.state, PrState.QUEUED)
+        self.assertIsNone(item.skip_reason)
+
+    def test_wip_title_takes_priority_over_marker_verdict(self):
+        item = self.build_items(
+            [make_found(1, SkipReason.WIP_TITLE)],
+            [make_snapshot(OLD_HEAD, title="Feature WIP: still changing")],
+        )[0]
+
+        self.assertIs(item.verdict, Verdict.SKIP)
+        self.assertIs(item.state, PrState.SKIP)
+        self.assertIs(item.skip_reason, SkipReason.WIP_TITLE)
+        self.assertEqual(item.verdict_label, "Skip (WIP)")
+        self.assertEqual(item.to_dict()["skip_reason"], "wip-title")
+
+    def test_draft_takes_priority_over_wip_title_and_marker_verdict(self):
+        for title, marker_sha in (
+            ("Feature still changing", None),
+            ("Feature WIP: still changing", HEAD),
+        ):
+            with self.subTest(title=title, marker_sha=marker_sha):
+                item = self.build_items(
+                    [make_found(1, SkipReason.DRAFT)],
+                    [make_snapshot(marker_sha, title=title)],
+                )[0]
+
+                self.assertIs(item.verdict, Verdict.SKIP)
+                self.assertIs(item.state, PrState.SKIP)
+                self.assertIs(item.skip_reason, SkipReason.DRAFT)
+                self.assertEqual(item.verdict_label, "Skip (WIP)")
+                self.assertEqual(item.to_dict()["skip_reason"], "draft")
+
+    def test_skipped_prs_still_show_their_title_and_marker(self):
+        found = [make_found(1, SkipReason.DRAFT), make_found(2, SkipReason.WIP_TITLE)]
+        items = self.build_items(
+            found, [make_snapshot(OLD_HEAD), make_snapshot(HEAD, title="[WIP] two")]
+        )
+
+        self.assertEqual(self.snapshot_urls, [pr.url for pr in found])
+        self.assertEqual([item.title for item in items], ["pr title", "[WIP] two"])
+        self.assertEqual([item.last_marker_sha for item in items], [OLD_HEAD, HEAD])
+
+    def test_snapshot_fills_the_item_and_discovery_keeps_the_axes(self):
+        item = self.build_items(
+            [make_found(1, matched_axes=["url", "author:me"])], [make_snapshot()]
+        )[0]
+
+        self.assertEqual(
+            (item.title, item.author, item.head_sha), ("pr title", "me", HEAD)
+        )
+        self.assertEqual(item.matched_axes, ["url", "author:me"])
+
+    def test_a_skipped_pr_whose_snapshot_fails_stays_skipped(self):
+        for skip_reason in (SkipReason.DRAFT, SkipReason.WIP_TITLE):
+            with self.subTest(skip_reason=skip_reason):
+                item = self.build_items(
+                    [make_found(1, skip_reason)], [gate.GhError("gh pr view failed")]
+                )[0]
+
+                self.assertIs(item.verdict, Verdict.SKIP)
+                self.assertIs(item.state, PrState.SKIP)
+                self.assertIs(item.skip_reason, skip_reason)
+                self.assertEqual(
+                    (item.head_sha, item.title, item.author, item.error),
+                    (OLD_HEAD, "", "", ""),
+                )
+
+    def test_a_failed_gate_check_has_no_verdict(self):
+        items = self.build_items(
+            [make_found(1), make_found(2, SkipReason.DRAFT)],
+            [gate.GhError("gh pr view failed: 502"), gate.GhError("gh pr view failed: 502")],
+        )
+
+        self.assertEqual(
+            [(item.state, item.verdict) for item in items],
+            [(PrState.FAILED, Verdict.UNKNOWN), (PrState.SKIP, Verdict.SKIP)],
+        )
+
+    def test_one_gh_error_fails_only_that_pr(self):
+        items = self.build_items(
+            [make_found(1), make_found(2), make_found(3)],
+            [make_snapshot(), gate.GhError("gh pr view failed: 502"), make_snapshot()],
+        )
+
+        self.assertEqual(
+            [item.state for item in items],
+            [PrState.QUEUED, PrState.FAILED, PrState.QUEUED],
+        )
+        self.assertEqual(items[1].error, "gate check failed: gh pr view failed: 502")
+        self.assertEqual(items[1].head_sha, OLD_HEAD)
+        self.assertEqual(items[1].matched_axes, ["author:me"])
+
+    def test_progress_is_emitted_per_pr(self):
+        items = self.build_items(
+            [make_found(1), make_found(2, SkipReason.DRAFT), make_found(3)],
+            [make_snapshot(), make_snapshot(), gate.GhError("boom")],
+        )
+
+        self.assertEqual(
+            [args for name, args in self.events if name == "discovery_progress"],
+            [(1, 3, items[0]), (2, 3, items[1]), (3, 3, items[2])],
         )

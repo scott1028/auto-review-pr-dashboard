@@ -16,6 +16,8 @@ class Verdict(str, Enum):
     FULL = "Full"
     INCREMENTAL = "Incremental"
     SKIP = "Skip"
+    # The gate check failed, so the marker - and the verdict - is not known.
+    UNKNOWN = "Unknown"
 
 
 class PrState(str, Enum):

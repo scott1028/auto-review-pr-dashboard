@@ -15,7 +15,14 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, RichLog, Static
 
+from .client import SessionClient
 from .config import RunConfig
+from .daemon import (
+    DAEMON_LOG_FILE_NAME,
+    SessionError,
+    get_resume_error,
+    load_runtime_metadata,
+)
 from .models import (
     Classification,
     LoopRecord,
@@ -25,13 +32,6 @@ from .models import (
     Verdict,
 )
 from .runner import LoopRunner
-from .session import (
-    DAEMON_LOG_FILE_NAME,
-    SessionClient,
-    SessionError,
-    get_resume_error,
-    load_runtime_metadata,
-)
 from .stats import format_duration, get_progress_bar, get_repo_progress_text, get_stats
 from .store import Store
 
@@ -62,7 +62,10 @@ VERDICT_STYLE = {
     Verdict.FULL: "bold",
     Verdict.INCREMENTAL: "cyan",
     Verdict.SKIP: "dim",
+    Verdict.UNKNOWN: "red",
 }
+# The dashboard's Verdict line; Unknown already shows up there as Failed.
+DASHBOARD_VERDICTS = (Verdict.FULL, Verdict.INCREMENTAL, Verdict.SKIP)
 
 # Column label, key, and fixed width; None width means the column fits its content.
 TABLE_COLUMNS = [
@@ -127,8 +130,9 @@ def get_row_cells(index: int, item) -> list:
     )
     return [
         str(index),
-        item.key,
-        title,
+        # A str cell is parsed as markup; a PR key and title are not ours to parse.
+        Text(item.key),
+        Text(title),
         Text(item.verdict_label, style=VERDICT_STYLE[item.verdict]),
         Text(item.state.value, style=STATE_STYLE[item.state]),
         new_posts,
@@ -151,7 +155,7 @@ class Dashboard(Static):
         self,
         config: RunConfig,
         record,
-        status: str,
+        status: Text,
         idle_remaining: float | None,
         block: tuple[str, float] | None = None,
     ) -> None:
@@ -166,37 +170,56 @@ class Dashboard(Static):
         )
         eta = f" · ETA {format_duration(stats['eta_sec'])}" if stats["eta_sec"] else ""
 
+        # Built from Text, so a block reason or a scope value is never markup.
         lines = []
         if block is not None:
             reason, remaining = block
             lines.append(
-                f"[b red]⚠ blocked[/b red]  {reason}  ·  retry in "
-                f"[b]{format_duration(remaining)}[/b]  ·  [dim]\\[n] retry now[/dim]"
+                Text.assemble(
+                    ("⚠ blocked", "b red"),
+                    f"  {reason}  ·  retry in ",
+                    (format_duration(remaining), "b"),
+                    "  ·  ",
+                    ("[n] retry now", "dim"),
+                )
             )
         lines += [
-            f"[b]{config.ai_cli}[/b] · {status}",
-            f"Scope    {get_scope_text(config)}",
-            f"Progress [green]{bar}[/green]  {stats['settled']}/{stats['total']} PR  ·  {repo_text}",
-            "Verdict  "
-            + " · ".join(
-                f"{verdict.value} {stats['verdicts'][verdict]}" for verdict in Verdict
-            )
-            + f" · Cancelled {stats['states'][PrState.CANCELLED]}"
-            + f" · Failed {stats['states'][PrState.FAILED]}",
-            "Posted   "
-            + f"inline {stats['posts'][PostKind.INLINE]}"
-            + f" · summary {stats['posts'][PostKind.SUMMARY]}"
-            + f" · passed-reply {stats['posts'][PostKind.REPLY]}"
-            + f" · no-change {stats['no_change']}",
-            "Finding  "
-            + " · ".join(
-                f"{classification.value} {stats['findings'][classification]}"
-                for classification in Classification
+            Text.assemble((config.ai_cli, "b"), " · ", status),
+            Text(f"Scope    {get_scope_text(config)}"),
+            Text.assemble(
+                "Progress ",
+                (bar, "green"),
+                f"  {stats['settled']}/{stats['total']} PR  ·  {repo_text}",
             ),
-            f"Timing   loop elapsed {format_duration(stats['elapsed_sec'])}"
-            f" · avg {format_duration(stats['avg_sec'])}/PR{eta}{next_loop}",
+            Text(
+                "Verdict  "
+                + " · ".join(
+                    f"{verdict.value} {stats['verdicts'][verdict]}"
+                    for verdict in DASHBOARD_VERDICTS
+                )
+                + f" · Cancelled {stats['states'][PrState.CANCELLED]}"
+                + f" · Failed {stats['states'][PrState.FAILED]}"
+            ),
+            Text(
+                "Posted   "
+                + f"inline {stats['posts'][PostKind.INLINE]}"
+                + f" · summary {stats['posts'][PostKind.SUMMARY]}"
+                + f" · passed-reply {stats['posts'][PostKind.REPLY]}"
+                + f" · no-change {stats['no_change']}"
+            ),
+            Text(
+                "Finding  "
+                + " · ".join(
+                    f"{classification.value} {stats['findings'][classification]}"
+                    for classification in Classification
+                )
+            ),
+            Text(
+                f"Timing   loop elapsed {format_duration(stats['elapsed_sec'])}"
+                f" · avg {format_duration(stats['avg_sec'])}/PR{eta}{next_loop}"
+            ),
         ]
-        self.update("\n".join(lines))
+        self.update(Text("\n").join(lines))
 
 
 class DetailScreen(Screen):
@@ -242,7 +265,7 @@ class DetailScreen(Screen):
         lines = self.app.get_log_lines(self.pr_key)
         self.placeholder_shown = not lines
         for line in lines or ["(no agent log yet — this PR has not started)"]:
-            log_widget.write(line)
+            log_widget.write(Text(line))
 
     def append_log(self, line: str) -> None:
         if not self.follow:
@@ -251,7 +274,8 @@ class DetailScreen(Screen):
         if self.placeholder_shown:
             log_widget.clear()
             self.placeholder_shown = False
-        log_widget.write(line)
+        # A Text is never parsed; agent output like "[/api]" is just text.
+        log_widget.write(Text(line))
 
     def action_toggle_follow(self) -> None:
         self.follow = not self.follow
@@ -269,16 +293,20 @@ class DetailScreen(Screen):
             return
 
         self.query_one("#detail-meta", Static).update(
-            f"[b]{item.key}[/b] · {item.title}\n"
-            f"Verdict [{VERDICT_STYLE[item.verdict]}]{item.verdict_label}[/] · "
-            f"State [{STATE_STYLE[item.state]}]{item.state.value}[/] · "
-            f"head {item.short_head} · "
-            f"last marker {item.last_marker_sha[:7] if item.last_marker_sha else '(none)'} · "
-            f"took {format_duration(item.duration_sec)} · "
-            f"exit {item.exit_code if item.exit_code is not None else '-'}"
-            + (f"\n[red]{item.error}[/red]" if item.error else "")
-            + f"\nmatched: {', '.join(item.matched_axes) or '-'}"
-            + f"\nlog: {item.log_path or '-'}"
+            Text.assemble(
+                (item.key, "b"),
+                f" · {item.title}\nVerdict ",
+                (item.verdict_label, VERDICT_STYLE[item.verdict]),
+                " · State ",
+                (item.state.value, STATE_STYLE[item.state]),
+                f" · head {item.short_head} · "
+                f"last marker {item.last_marker_sha[:7] if item.last_marker_sha else '(none)'} · "
+                f"took {format_duration(item.duration_sec)} · "
+                f"exit {item.exit_code if item.exit_code is not None else '-'}",
+                (f"\n{item.error}", "red") if item.error else "",
+                f"\nmatched: {', '.join(item.matched_axes) or '-'}",
+                f"\nlog: {item.log_path or '-'}",
+            )
         )
         self.query_one("#detail-posts", Static).update(self.get_posts_text(item))
 
@@ -291,14 +319,19 @@ class DetailScreen(Screen):
             for entry in history
         )
         self.query_one("#detail-history", Static).update(
-            f"[b]History (across loops)[/b]\n{history_text or '(no earlier loops)'}"
+            Text.assemble(
+                ("History (across loops)", "b"),
+                f"\n{history_text or '(no earlier loops)'}",
+            )
         )
 
-    def get_posts_text(self, item) -> str:
+    def get_posts_text(self, item) -> Text:
         if not item.new_posts:
-            return f"[b]Posted this loop (0)[/b]\n{self.get_no_change_reason(item)}"
+            return Text.assemble(
+                ("Posted this loop (0)", "b"), "\n", self.get_no_change_reason(item)
+            )
 
-        lines = [f"[b]Posted this loop ({len(item.new_posts)})[/b]"]
+        lines = [Text(f"Posted this loop ({len(item.new_posts)})", style="b")]
         for post in item.new_posts:
             # The headline already carries the **blocking** / **non-blocking** prefix
             # verbatim, so only the colour is added here.
@@ -306,31 +339,32 @@ class DetailScreen(Screen):
                 post.classification.value if post.classification else post.kind.value
             )
             style = CLASSIFICATION_STYLE.get(post.classification, "")
-            lines.append(
-                f" · {post.kind.value:<7} {f'[{style}]{text}[/]' if style else text}"
-            )
-            lines.append(f"   {'':<7} [dim]{post.url}[/dim]")
+            lines.append(Text.assemble(f" · {post.kind.value:<7} ", (text, style)))
+            lines.append(Text.assemble(f"   {'':<7} ", (post.url, "dim")))
         if item.state is PrState.CANCELLED:
             lines.append(
-                "[yellow]Posted before cancelling; if the summary marker never went out, "
-                "the next loop reviews this SHA again.[/yellow]"
+                Text(
+                    "Posted before cancelling; if the summary marker never went out, "
+                    "the next loop reviews this SHA again.",
+                    style="yellow",
+                )
             )
-        return "\n".join(lines)
+        return Text("\n").join(lines)
 
-    def get_no_change_reason(self, item) -> str:
+    def get_no_change_reason(self, item) -> Text:
         if item.state is PrState.SKIP:
             if item.skip_reason is SkipReason.DRAFT:
-                return "[dim]Skip: Draft PR; no agent started, nothing posted.[/dim]"
+                return Text("Skip: Draft PR; no agent started, nothing posted.", style="dim")
             if item.skip_reason is SkipReason.WIP_TITLE:
-                return "[dim]Skip: WIP title; no agent started, nothing posted.[/dim]"
-            return "[dim]Skip: head SHA matches the last marker; no agent started, nothing posted.[/dim]"
+                return Text("Skip: WIP title; no agent started, nothing posted.", style="dim")
+            return Text("Skip: head SHA matches the last marker; no agent started, nothing posted.", style="dim")
         if item.state is PrState.CANCELLED:
-            return "[magenta]Cancelled: nothing was posted before the agent stopped.[/magenta]"
+            return Text("Cancelled: nothing was posted before the agent stopped.", style="magenta")
         if item.state is PrState.FAILED:
-            return f"[red]Failed: {item.error or 'the agent exited abnormally'}; nothing posted.[/red]"
+            return Text(f"Failed: {item.error or 'the agent exited abnormally'}; nothing posted.", style="red")
         if item.state is PrState.DONE:
-            return "[dim]The agent posted nothing (unchanged head SHA, or zero findings).[/dim]"
-        return "[dim]Not started yet.[/dim]"
+            return Text("The agent posted nothing (unchanged head SHA, or zero findings).", style="dim")
+        return Text("Not started yet.", style="dim")
 
 
 class ConfirmQuitScreen(ModalScreen[bool]):
@@ -342,13 +376,16 @@ class ConfirmQuitScreen(ModalScreen[bool]):
         Binding("right", "app.focus_next", "yes", show=False),
     ]
 
-    def __init__(self, message: str):
+    def __init__(self, message: Text):
         super().__init__()
         self.message = message
 
     def compose(self) -> ComposeResult:
         with Vertical(id="confirm-quit"):
-            yield Static(f"[b]Quit?[/b]\n{self.message}", id="confirm-quit-message")
+            yield Static(
+                Text.assemble(("Quit?", "b"), "\n", self.message),
+                id="confirm-quit-message",
+            )
             with Horizontal(id="confirm-quit-buttons"):
                 yield Button("No, keep running", id="confirm-quit-no", variant="primary")
                 yield Button("Yes, quit", id="confirm-quit-yes", variant="error")
@@ -447,6 +484,11 @@ class AutoReviewPrDashboardApp(App):
         # were attached to is mid-recycle right now.
         self.recycle_count = 0
         self.is_recycling = False
+        # q asked the daemon to stop, so its socket closing is expected.
+        self.is_stopping = False
+        # Why the daemon connection died; main prints it after the TUI closes.
+        self.exit_message = ""
+        self.is_exiting = False
         self._log_buffer: dict[str, list[str]] = {}
         # Which agent's output the activity panel is following, and whether the
         # user pinned it open (otherwise it auto-hides once the queue is ready).
@@ -493,12 +535,24 @@ class AutoReviewPrDashboardApp(App):
         elif self.runner is not None:
             self.runner.stop()
 
+    def exit_once(self, result: str | None = None, message: str = "") -> None:
+        """Exit with the first result and reason; a later exit() would replace both.
+
+        A daemon that refuses an attach sends a fatal error and then closes the
+        socket: the error is the reason, not the "disconnected" that follows.
+        """
+        if self.is_exiting:
+            return
+        self.is_exiting = True
+        self.exit_message = message
+        self.exit(result=result)
+
     async def connect_session(self) -> None:
         try:
             await self.session.connect(self.handle_session_message)
         except (ConnectionError, OSError, SessionError) as error:
-            self.notify(str(error), severity="error", timeout=10)
-            self.exit(result="connection-error")
+            self.notify(str(error), severity="error", timeout=10, markup=False)
+            self.exit_once("connection-error", str(error))
 
     async def reattach_session(self) -> None:
         """Follow a recycled daemon: wait for its metadata, then attach again."""
@@ -516,14 +570,13 @@ class AutoReviewPrDashboardApp(App):
                 self.is_recycling = False
                 return
             if time.monotonic() >= deadline:
-                self.notify(
+                reason = (
                     "the restarted daemon did not become attachable within "
                     f"{RECYCLE_REATTACH_TIMEOUT_SEC}s; see "
-                    f"{self.store.base_dir / DAEMON_LOG_FILE_NAME}",
-                    severity="error",
-                    timeout=10,
+                    f"{self.store.base_dir / DAEMON_LOG_FILE_NAME}"
                 )
-                self.exit(result="disconnected")
+                self.notify(reason, severity="error", timeout=10, markup=False)
+                self.exit_once("disconnected", reason)
                 return
             await asyncio.sleep(0.2)
 
@@ -568,26 +621,31 @@ class AutoReviewPrDashboardApp(App):
             self.notify(
                 message["message"],
                 severity=message.get("severity", "information"),
+                markup=False,
             )
         elif message_type == "error":
-            self.notify(message["message"], severity="error", timeout=10)
+            self.notify(message["message"], severity="error", timeout=10, markup=False)
             # Mid-recycle the old daemon closing with a keypress in flight hits
             # ECONNRESET; the "disconnected" message that follows reattaches.
-            if message.get("fatal") and not self.is_recycling:
-                self.exit(result="connection-error")
+            if message.get("fatal") and not self.is_recycling and not self.is_stopping:
+                self.exit_once("connection-error", message["message"])
         elif message_type == "replaced":
-            self.notify(message["message"], severity="warning")
-            self.exit(result="replaced")
+            self.notify(message["message"], severity="warning", markup=False)
+            self.exit_once("replaced")
         elif message_type == "recycling":
             # The daemon is restarting itself; its socket closing is expected.
             self.is_recycling = True
-            self.notify(message["message"], severity="warning")
+            self.notify(message["message"], severity="warning", markup=False)
         elif message_type == "disconnected":
+            if self.is_stopping:
+                # A second exit() would replace the "stopped" result.
+                self.exit_once("stopped")
+                return
             if self.is_recycling:
                 self.run_worker(self.reattach_session(), name="reattach")
                 return
-            self.notify(message["message"], severity="error")
-            self.exit(result="disconnected")
+            self.notify(message["message"], severity="error", markup=False)
+            self.exit_once("disconnected", message["message"])
 
     # ---- runner events ------------------------------------------------------
 
@@ -644,7 +702,12 @@ class AutoReviewPrDashboardApp(App):
         elif name == "blocked":
             self.block_reason, blocked_until = payload
             self.block_remaining = max(0.0, blocked_until - time.time())
-            self.notify(f"blocked: {self.block_reason}", severity="warning", timeout=15)
+            self.notify(
+                f"blocked: {self.block_reason}",
+                severity="warning",
+                timeout=15,
+                markup=False,
+            )
         elif name == "blocked_tick":
             self.block_remaining = payload[0]
         elif name == "unblocked":
@@ -653,7 +716,7 @@ class AutoReviewPrDashboardApp(App):
         elif name == "paused":
             self.paused = payload[0]
         elif name == "error":
-            self.notify(str(payload[0]), severity="error", timeout=10)
+            self.notify(str(payload[0]), severity="error", timeout=10, markup=False)
 
         if name == "item_update" and payload[0].state is PrState.RUNNING:
             self.show_activity_log(payload[0].key, self.activity_pinned)
@@ -665,7 +728,6 @@ class AutoReviewPrDashboardApp(App):
     def get_phase_elapsed_text(self) -> str:
         """Something that visibly moves even while the agent is silent."""
         elapsed = format_duration(time.time() - self.phase_started_at)
-        # criteria parsing removed
         return elapsed
 
     def refresh_view(self) -> None:
@@ -677,12 +739,13 @@ class AutoReviewPrDashboardApp(App):
             self.block_remaining = max(0.0, self.blocked_until - time.time())
         elif self.session is not None:
             self.block_remaining = None
-        status = f"{self.status} · {self.get_phase_elapsed_text()}"
+        status = Text(f"{self.status} · {self.get_phase_elapsed_text()}")
         if self.session is not None:
             # Only a daemon recycles, so the in-process loop reports nothing.
-            status = f"{status} · cleaned {self.recycle_count}×"
+            status.append(f" · cleaned {self.recycle_count}×")
         if self.paused:
-            status = f"{status} · [yellow]paused[/yellow]"
+            status.append(" · ")
+            status.append("paused", style="yellow")
         block = (
             (self.block_reason, self.block_remaining)
             if self.block_remaining is not None
@@ -756,14 +819,15 @@ class AutoReviewPrDashboardApp(App):
             self.activity_key = key
             panel.clear()
             for line in self.get_log_lines(key):
-                panel.write(line)
-        panel.border_title = f"agent log · {self.activity_key or '-'}"
+                panel.write(Text(line))
+        # A str title is parsed as markup, and the key comes from pr-discover.
+        panel.border_title = Text(f"agent log · {self.activity_key or '-'}")
         panel.display = visible
 
     def append_activity_log(self, key: str, line: str) -> None:
         panel = self.query_one("#activity-log", RichLog)
         if panel.display and key == self.activity_key:
-            panel.write(line)
+            panel.write(Text(line))
 
     def action_toggle_activity_log(self) -> None:
         panel = self.query_one("#activity-log", RichLog)
@@ -824,21 +888,21 @@ class AutoReviewPrDashboardApp(App):
     def cancel_pr(self, key: str) -> None:
         if self.session is not None:
             self.send_session_command("cancel", key)
-            self.notify(f"cancel requested for {key}")
+            self.notify(f"cancel requested for {key}", markup=False)
         elif self.runner and self.runner.cancel(key):
-            self.notify(f"cancelled {key}")
+            self.notify(f"cancelled {key}", markup=False)
         else:
-            self.notify(f"{key} is not queued or running", severity="warning")
+            self.notify(f"{key} is not queued or running", severity="warning", markup=False)
         self.refresh_view()
 
     def resume_pr(self, key: str) -> None:
         if self.session is not None:
             self.send_session_command("resume", key)
-            self.notify(f"resume requested for {key}")
+            self.notify(f"resume requested for {key}", markup=False)
         elif self.runner and self.runner.resume(key):
-            self.notify(f"{key} requeued at the tail")
+            self.notify(f"{key} requeued at the tail", markup=False)
         else:
-            self.notify(f"{key} is not cancelled", severity="warning")
+            self.notify(f"{key} is not cancelled", severity="warning", markup=False)
         self.refresh_view()
 
     def action_cancel(self) -> None:
@@ -877,7 +941,7 @@ class AutoReviewPrDashboardApp(App):
         if self.session is None:
             self.notify("background mode needs a daemon session", severity="warning")
             return
-        self.exit(result="background")
+        self.exit_once("background")
 
     def action_quit_app(self) -> None:
         running_keys = self.get_running_keys()
@@ -896,15 +960,20 @@ class AutoReviewPrDashboardApp(App):
             item.key for item in self.record.items if item.state is PrState.RUNNING
         ]
 
-    def get_quit_message(self, running_keys: list[str]) -> str:
+    def get_quit_message(self, running_keys: list[str]) -> Text:
         running = ", ".join(running_keys)
         tail = (
-            "Quitting stops the daemon, so the queue stops with it. "
-            "Press [b]d[/b] instead to background the run."
+            Text.assemble(
+                "Quitting stops the daemon, so the queue stops with it. Press ",
+                ("d", "b"),
+                " instead to background the run.",
+            )
             if self.session is not None
-            else "Quitting stops the review loop as well."
+            else Text("Quitting stops the review loop as well.")
         )
-        return f"Still reviewing {running}; every running agent gets killed.\n{tail}"
+        return Text.assemble(
+            f"Still reviewing {running}; every running agent gets killed.\n", tail
+        )
 
     def handle_quit_confirmed(self, confirmed: bool | None) -> None:
         if not confirmed:
@@ -913,11 +982,12 @@ class AutoReviewPrDashboardApp(App):
 
     def quit_app(self) -> None:
         if self.session is not None:
+            self.is_stopping = True
             self.run_worker(self.stop_session(), name="stop-session")
             return
         if self.runner:
             self.runner.stop()
-        self.exit()
+        self.exit_once()
 
     def send_session_command(self, action: str, key: str | None = None) -> None:
         self.run_worker(
@@ -931,12 +1001,12 @@ class AutoReviewPrDashboardApp(App):
         try:
             await self.session.send_command(action, key)
         except (ConnectionError, OSError, SessionError) as error:
-            self.notify(str(error), severity="error", timeout=10)
+            self.notify(str(error), severity="error", timeout=10, markup=False)
 
     async def stop_session(self) -> None:
         try:
             await self.session.send_command("stop")
         except (ConnectionError, OSError, SessionError) as error:
-            self.notify(str(error), severity="error", timeout=10)
+            self.notify(str(error), severity="error", timeout=10, markup=False)
         finally:
-            self.exit(result="stopped")
+            self.exit_once("stopped")

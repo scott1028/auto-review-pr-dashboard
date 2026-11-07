@@ -38,6 +38,16 @@ class Store:
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
+    def load_loop_index(self) -> int:
+        """The index saved by save_state; 0 when state.json is missing or corrupt."""
+        try:
+            payload = json.loads(
+                (self.base_dir / "state.json").read_text(encoding="utf-8")
+            )
+            return int(payload["loop_index"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return 0
+
     def prune_logs(self) -> None:
         """Drop the oldest loop log dirs - nothing else ever deletes them.
 

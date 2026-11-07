@@ -40,7 +40,7 @@ install:
 # Reverses install. Refuses while a daemon is still running, since removing the
 # socket directory would orphan it.
 uninstall:
-	@if [ -z "$(FORCE)" ] && pgrep -u "$$(id -u)" -f "auto_review_pr_dashboard\.session" >/dev/null 2>&1; then \
+	@if [ -z "$(FORCE)" ] && pgrep -u "$$(id -u)" -f -- "-m auto_review_pr_dashboard\.daemon$$" >/dev/null 2>&1; then \
 		echo "$(NAME): a daemon is still running - quit it with 'q' in the dashboard first"; \
 		echo "  ($(NAME) -l lists the working directories; or force with: make uninstall FORCE=1)"; \
 		exit 1; \

@@ -14,7 +14,16 @@ dashboard 只是它的螢幕，關掉也沒關係，再開一個就接回來了�
 
 開始之前，你需要：
 
-- 已經登入的 `gh`，工具靠它找 PR、讀留言
+- 已經登入的 `gh`，工具和 `pr-discover` 都靠它讀 GitHub
+- `PATH` 上要有 [`pr-discover`](https://github.com/scott1028/pr-discover)，工具靠它找 PR。
+  下面的打包版不含它，要另外裝。x86_64 Linux 可以直接下載它的 AppImage；用原始碼裝的
+  方法在[安裝做了哪些事](docs/guide.md#安裝做了哪些事)：
+
+  ```bash
+  gh release download --repo scott1028/pr-discover --pattern '*-x86_64.AppImage' --output ~/.local/bin/pr-discover --clobber
+  chmod +x ~/.local/bin/pr-discover
+  ```
+
 - Python 3.10 以上，還有 uv（沒有 uv 也行，見下面）
 - 一個 AI CLI，例如 `codex` 或 `claude`
 
@@ -54,6 +63,7 @@ auto-review-pr-dashboard -l
   --parallel N        同時最多審 N 個 PR(預設:1)
   --dry-run           只探索、印判決表,不審任何 PR
   -l, --list          列出有活著 daemon 可續的工作目錄
+  -h, --help          印出完整說明和範例
   -- ARGS...          把 ARGS 塞給 <ai_cli>:內建 flag 之後、prompt 之前
 
 auto-review-pr-dashboard codex --repo-url owner/repo --author <login> --dry-run
@@ -64,13 +74,16 @@ auto-review-pr-dashboard codex --pr-url https://github.com/owner/repo/pull/<n> -
 範圍只看 flag，不會從 prompt 的文字去猜，所以搜尋做不到的條件，像是「有 label X 的 PR」，
 寫進 prompt 也沒用。不確定範圍對不對，就先加 `--dry-run` 跑一次看看。
 
-`--repo-url` 可以填 `owner/repo` 或任何 git url。填成 PR 的 url 的話，它會擋下來，
-提醒你改用 `--pr-url`。寫在命令前面的 inline 環境變數，會一起傳給 `gh` 和 agent（實際去審
-PR 的 AI process）。
+範圍由 `pr-discover` 檢查。`--repo-url` 可以填 `owner/repo`、GitHub 的 https url（可以帶
+`.git`），或 `git@github.com:owner/repo.git` 這種 ssh remote；填成 PR 的 url 會被擋下來，
+提醒你改用 `--pr-url`。範圍有錯的話，工具會印出 `pr-discover` 給的原因，以 exit 1 結束，
+這時還沒開 daemon，也還沒建 `prompt.md`。寫在命令前面的 inline 環境變數，會一起傳給
+`pr-discover`、`gh` 和 agent（實際去審 PR 的 AI process）。
 
 啟動後，工具會替你目前的工作目錄開一個 daemon，然後接上去。之後想接回來，
 就到同一個目錄單獨跑 `--resume`，原本開著的 dashboard 會自己退出，由新的接手。daemon
-如果掛了，工具只會告訴你，不會自己重開。`--dry-run` 則一律在前台跑。
+掛了或連線斷了，dashboard 關掉後會在 stderr 印出原因，但工具不會自己重開 daemon。
+`--dry-run` 則一律在前台跑。
 
 ### prompt.md 怎麼寫
 
@@ -97,14 +110,14 @@ dashboard 有兩個畫面：列表顯示所有 PR，詳情頁顯示單一個 PR 
 |---|---|---|
 | `↑` / `↓`、滑鼠點擊 | 列表 | 選 PR；用滑鼠的話，點一下就直接打開 |
 | `enter` | 列表 | 打開這個 PR 的詳情頁 |
-| `c` | 列表 / 詳情頁 | 取消這個 PR，連同正在跑的 agent 和它開的子 process（整個 process group）一起砍掉 |
+| `c` | 列表 / 詳情頁 | 取消這個 PR，連同正在跑的 agent 和它開的子 process（整個 process group）一起砍掉；agent 還沒啟動的話，就不會再啟動 |
 | `r` | 列表 / 詳情頁 | 把取消掉的 PR 重新排回這一輪，排在最後面 |
 | `n` | 任何地方 | 不等了，直接跳過倒數；兩輪之間的等待和 cooldown（撞到用量上限後的等待）都適用 |
 | `p` | 任何地方 | 暫停：跑到一半的 PR 會跑完，但不會再開新的；倒數也會停住 |
 | `l` | 任何地方 | 打開或收起即時的 agent log 面板 |
 | `d` | 任何地方 | 背景執行：關掉 dashboard，daemon 繼續跑 |
-| `f` / `esc` | 詳情頁 | 切換 log follow（開著會一直接上新的 log，關掉就停住） / 回到列表 |
-| `q` | 任何地方 | 停掉 daemon 並離開。每個 agent 會先收到 SIGTERM，過 `TERMINATE_GRACE_SEC`（5 秒，在 `runner.py`）後再收到 SIGKILL。還有 PR 在跑的話會先問你，預設選 No |
+| `f` / `esc`、`backspace` | 詳情頁 | 切換 log follow（開著會一直接上新的 log，關掉就停住） / 回到列表 |
+| `q` | 任何地方 | 停掉 daemon 並離開。每個 agent 會先收到 SIGTERM，過 `TERMINATE_GRACE_SEC`（5 秒，在 `runner.py`）後再收到 SIGKILL。還有 PR 在跑的話會先問你，預設選 No（`←` / `→` 選、`enter` 確定，`esc` 或 `q` 保持執行） |
 
 ## Architecture: TUI → IPC → Service
 
@@ -112,15 +125,17 @@ dashboard 有兩個畫面：列表顯示所有 PR，詳情頁顯示單一個 PR 
 之間傳訊息的管道（這裡用 unix socket），Service 就是真正在跑審查的 daemon。
 
 ```text
-  終端機（可丟）                 背景的 daemon（工作歸它）
-┌──────────────────────┐  JSON   ┌──────────────────────────────────┐
-│ app.py — Textual TUI │  lines  │ session.py — SessionServer       │
-│  render snapshot     │◀────────│   snapshot / log / tick / notice │
-│  keypress → command  │────────▶│   cancel resume run_now pause    │
-└──────────────────────┘  unix   │ runner.py — LoopRunner           │
-   關掉它，什麼都不丟            │ store.py — .tmp/ artifacts       │
-   --resume 接回來               └──────────────────────────────────┘
-                                       └─▶ 每個跑中的 PR 一個 process group: <ai_cli>
+  終端機（可丟）                        背景的 daemon（工作歸它）
+┌─────────────────────────────┐  JSON   ┌──────────────────────────────────┐
+│ app.py — Textual TUI        │  lines  │ server.py — SessionServer        │
+│  render snapshot            │◀────────│   snapshot / log / tick / notice │
+│  keypress → command         │────────▶│   cancel resume run_now pause    │
+│ client.py — SessionClient   │  unix   │ runner.py — LoopRunner           │
+│ daemon.py — start/resume/-l │         │ store.py — .tmp/ artifacts       │
+└─────────────────────────────┘         │ daemon.py — the -m entry         │
+   關掉它，什麼都不丟                   └──────────────────────────────────┘
+   --resume 接回來
+                                          └─▶ 每個跑中的 PR 一個 process group: <ai_cli>
 ```
 
 - **審查要活得比終端機久。** 一個 PR 可能要審 30 分鐘，一輪 loop 可能跑好幾個小時。如果
@@ -147,14 +162,15 @@ dashboard 有兩個畫面：列表顯示所有 PR，詳情頁顯示單一個 PR 
 .tmp/auto-review-pr-dashboard/
 ├── daemon.json                 # 現任 daemon 中繼資料與 socket 位置
 ├── daemon.log                  # daemon 診斷
-├── state.json                  # run 設定 + 目前 loop 序號
+├── state.json                  # run 設定 + 目前 loop 序號（重啟後接著編號）
 ├── loops/loop-0003.json        # 每輪紀錄:判決、狀態、貼文 diff、時間
 └── logs/loop-0003/owner__repo__7.log
 ```
 
-daemon 每 `RECYCLE_EVERY_LOOPS` 輪（10 輪，常數在 `session.py`）會換班一次，
+loop 序號每到 `RECYCLE_EVERY_LOOPS`（10，常數在 `server.py`）的倍數，daemon 就會換班一次，
 把工作交給一個新的 daemon。換班時會清空整個 `.tmp/`，連別的工具放在裡面的檔案也一起刪掉，
-這樣 `loops/` 和 `daemon.log` 才不會一直長大。狀態列會用 `cleaned N×` 顯示清過幾次。
+這樣 `loops/` 和 `daemon.log` 才不會一直長大。重啟後序號會接著編，所以兩次清理之間最多
+10 輪，不一定是這個 daemon 自己跑滿 10 輪。狀態列會用 `cleaned N×` 顯示清過幾次。
 
 兩次換班之間，`logs/` 只留**最新的 10 個 loop 目錄**（是 10 輪，不是 10 小時）。
 想多留一點，就改 `store.py` 裡的 `MAX_KEPT_LOOP_DIRS`。
@@ -163,7 +179,8 @@ daemon 每 `RECYCLE_EVERY_LOOPS` 輪（10 輪，常數在 `session.py`）會換�
 
 - `--parallel` 開多個 agent 時，它們共用同一個工作目錄；如果都用固定檔名的暫存檔，
   就會撞在一起。
-- `-l` 是靠讀 `/proc` 找 daemon 的，所以只支援 Linux，也只看得到你自己這個使用者的
+- `-l` 是讀 `/proc`，找以 `-m auto_review_pr_dashboard.daemon`（`daemon.py` 的
+  `DAEMON_MODULE`）啟動的 daemon，所以只支援 Linux，也只看得到你自己這個使用者的
   daemon。dashboard 本身則需要 TTY。
 - 用量上限是靠比對 agent 的錯誤訊息來判斷的，這份樣式清單只能盡量涵蓋。看到新的措辭，
   就加進 `config.py` 的 `USAGE_LIMIT_PATTERNS`；真正的安全網是「連續失敗兩次」這條規則。

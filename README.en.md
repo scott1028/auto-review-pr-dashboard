@@ -17,7 +17,17 @@ Close it whenever you like, then open another one to pick up where you left off.
 
 Before you start, you need:
 
-- `gh`, logged in. The tool uses it to find PRs and read comments.
+- `gh`, logged in. Both the tool and `pr-discover` use it to read GitHub.
+- [`pr-discover`](https://github.com/scott1028/pr-discover) on your `PATH`. The tool uses
+  it to find PRs. The prebuilt binaries below don't include it, so install it separately.
+  On x86_64 Linux you can download its AppImage; installing from source is covered in
+  [What install does](docs/guide.en.md#what-install-does):
+
+  ```bash
+  gh release download --repo scott1028/pr-discover --pattern '*-x86_64.AppImage' --output ~/.local/bin/pr-discover --clobber
+  chmod +x ~/.local/bin/pr-discover
+  ```
+
 - Python 3.10 or newer, plus uv (no uv works too, see below)
 - An AI CLI, such as `codex` or `claude`
 
@@ -59,6 +69,7 @@ auto-review-pr-dashboard -l
   --parallel N        review at most N PRs at a time (default: 1)
   --dry-run           explore only, print the verdict table, review nothing
   -l, --list          list working dirs with a live daemon to resume
+  -h, --help          print the full help and examples
   -- ARGS...          pass ARGS to <ai_cli>: after built-in flags, before the prompt
 
 auto-review-pr-dashboard codex --repo-url owner/repo --author <login> --dry-run
@@ -70,14 +81,18 @@ Scope comes only from the flags; the tool never guesses it from the prompt text.
 condition the search can't express, like "PRs with label X", does nothing in the prompt.
 If you're not sure the scope is right, run once with `--dry-run` first.
 
-`--repo-url` takes `owner/repo` or any git url. Give it a PR url and it refuses, telling
-you to use `--pr-url` instead. Inline env vars in front of the command reach both `gh` and
-the agent (the AI process that actually reviews a PR).
+`pr-discover` checks the scope. `--repo-url` takes `owner/repo`, the repo's GitHub https
+url (`.git` allowed), or an ssh remote like `git@github.com:owner/repo.git`; give it a PR
+url and it refuses, telling you to use `--pr-url` instead. With a bad scope, the tool
+prints `pr-discover`'s reason and exits 1, before any daemon starts and before
+`prompt.md` is created. Inline env vars in front of the command reach `pr-discover`, `gh`,
+and the agent (the AI process that actually reviews a PR).
 
 When you start it, the tool spawns a daemon for your current working directory and
 attaches to it. To come back later, run `--resume` on its own from the same directory; the
-dashboard that was open quits and the new one takes over. If the daemon dies, the tool
-tells you but never restarts it. `--dry-run` always runs in the foreground.
+dashboard that was open quits and the new one takes over. If the daemon dies or the
+connection drops, the reason is printed on stderr once the dashboard closes, but the tool
+never restarts the daemon. `--dry-run` always runs in the foreground.
 
 ### Writing prompt.md
 
@@ -108,14 +123,14 @@ status and log.
 |---|---|---|
 | `↑` / `↓`, mouse click | list | select a PR; with the mouse, a single click opens it |
 | `enter` | list | open the PR's detail page |
-| `c` | list / detail | cancel this PR, killing the running agent along with its child processes (its whole process group) |
+| `c` | list / detail | cancel this PR, killing the running agent along with its child processes (its whole process group); if its agent hasn't started yet, it never starts |
 | `r` | list / detail | put a cancelled PR back into this round, at the end of the queue |
 | `n` | anywhere | stop waiting and skip the countdown, whether it's the wait between rounds or a cooldown (the pause after a usage limit) |
 | `p` | anywhere | pause: PRs already running finish, but no new ones start; countdowns freeze |
 | `l` | anywhere | show or hide the live agent log panel |
 | `d` | anywhere | detach: close the dashboard and leave the daemon running |
-| `f` / `esc` | detail | toggle log follow (on: new log lines keep arriving; off: the log holds still) / back to the list |
-| `q` | anywhere | stop the daemon and quit. Each agent gets SIGTERM, then SIGKILL after `TERMINATE_GRACE_SEC` (5s, in `runner.py`). If PRs are still running it asks first, defaulting to No |
+| `f` / `esc`, `backspace` | detail | toggle log follow (on: new log lines keep arriving; off: the log holds still) / back to the list |
+| `q` | anywhere | stop the daemon and quit. Each agent gets SIGTERM, then SIGKILL after `TERMINATE_GRACE_SEC` (5s, in `runner.py`). If PRs are still running it asks first, defaulting to No (`←` / `→` to choose, `enter` to confirm, `esc` or `q` to keep running) |
 
 ## Architecture: TUI → IPC → Service
 
@@ -124,15 +139,17 @@ screen you see in the terminal, IPC is the channel two processes use to talk (a 
 socket here), and the Service is the daemon that actually runs the reviews.
 
 ```text
-  terminal (disposable)          detached daemon (owns the work)
-┌──────────────────────┐  JSON   ┌──────────────────────────────────┐
-│ app.py — Textual TUI │  lines  │ session.py — SessionServer       │
-│  render snapshot     │◀────────│   snapshot / log / tick / notice │
-│  keypress → command  │────────▶│   cancel resume run_now pause    │
-└──────────────────────┘  unix   │ runner.py — LoopRunner           │
-   close it, lose nothing        │ store.py — .tmp/ artifacts       │
-   --resume picks it up          └──────────────────────────────────┘
-                                       └─▶ one process group per running PR: <ai_cli>
+  terminal (disposable)                 detached daemon (owns the work)
+┌─────────────────────────────┐  JSON   ┌──────────────────────────────────┐
+│ app.py — Textual TUI        │  lines  │ server.py — SessionServer        │
+│  render snapshot            │◀────────│   snapshot / log / tick / notice │
+│  keypress → command         │────────▶│   cancel resume run_now pause    │
+│ client.py — SessionClient   │  unix   │ runner.py — LoopRunner           │
+│ daemon.py — start/resume/-l │         │ store.py — .tmp/ artifacts       │
+└─────────────────────────────┘         │ daemon.py — the -m entry         │
+   close it, lose nothing               └──────────────────────────────────┘
+   --resume picks it up
+                                          └─▶ one process group per running PR: <ai_cli>
 ```
 
 - **Reviews have to outlive your terminal.** A PR can take 30 minutes to review, and a
@@ -165,15 +182,17 @@ parent directory that holds all your repos:
 .tmp/auto-review-pr-dashboard/
 ├── daemon.json                 # current daemon metadata and socket location
 ├── daemon.log                  # daemon diagnostics
-├── state.json                  # run config + current loop number
+├── state.json                  # run config + current loop number (a restart continues it)
 ├── loops/loop-0003.json        # per-round record: verdicts, states, post diffs, times
 └── logs/loop-0003/owner__repo__7.log
 ```
 
-Every `RECYCLE_EVERY_LOOPS` rounds (10, set in `session.py`) the daemon changes shifts,
-handing its work to a fresh daemon. A shift change wipes the whole `.tmp/`, including
-files other tools left there, which keeps `loops/` and `daemon.log` from growing forever.
-The status bar counts these wipes as `cleaned N×`.
+Whenever the loop number reaches a multiple of `RECYCLE_EVERY_LOOPS` (10, set in
+`server.py`), the daemon changes shifts, handing its work to a fresh daemon. A shift
+change wipes the whole `.tmp/`, including files other tools left there, which keeps
+`loops/` and `daemon.log` from growing forever. Loop numbers continue after a restart, so
+there are at most 10 rounds between two cleanups, not always 10 rounds of one daemon. The
+status bar counts these wipes as `cleaned N×`.
 
 Between shift changes, `logs/` keeps only **the 10 most recent loop directories** (that's
 10 rounds, not 10 hours). To keep more, change `MAX_KEPT_LOOP_DIRS` in `store.py`.
@@ -182,7 +201,8 @@ Between shift changes, `logs/` keeps only **the 10 most recent loop directories*
 
 - With `--parallel`, the agents share one working directory, so temp files with fixed
   names collide.
-- `-l` finds daemons by reading `/proc`, so it only works on Linux and only sees your own
+- `-l` reads `/proc` for processes started as `-m auto_review_pr_dashboard.daemon`
+  (`DAEMON_MODULE` in `daemon.py`), so it only works on Linux and only sees your own
   user's daemons. The dashboard itself needs a TTY.
 - Usage limits are detected by matching the agent's error output, and the pattern list
   can't cover everything. When you see new wording, add it to `USAGE_LIMIT_PATTERNS` in

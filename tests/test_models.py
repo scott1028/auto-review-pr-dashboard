@@ -71,6 +71,14 @@ class ModelSerializationTestCase(unittest.TestCase):
         self.assertIs(restored.skip_reason, SkipReason.HEAD_ALREADY_REVIEWED)
         self.assertIs(restored.new_posts[0].kind, PostKind.SUMMARY)
 
+    def test_an_unknown_verdict_round_trips(self):
+        item = PrItem("o/r", 1, "u", "t", "me", "abc", verdict=Verdict.UNKNOWN)
+
+        restored = PrItem.from_dict(item.to_dict())
+
+        self.assertIs(restored.verdict, Verdict.UNKNOWN)
+        self.assertEqual(restored.verdict_label, "Unknown")
+
     def test_loop_record_round_trip(self):
         item = PrItem(
             repo="o/r",

@@ -8,3 +8,4 @@ __pycache__/
 
 # Generated from uv.lock by: make requirements
 /requirements.txt
+/references/

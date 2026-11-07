@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import sys
 import time
 from pathlib import Path
@@ -14,7 +13,9 @@ from .config import (
     UnsupportedAiCliError,
     get_ai_cli_family,
 )
-from .models import Verdict
+from .discover import DiscoverError, discover_prs
+from .gate import GhError
+from .models import PrState, Verdict
 
 USAGE_EXAMPLES = """prompt file:
   prompt.md in the current working directory is read once at startup.
@@ -45,13 +46,22 @@ examples:
 LIST_ARGV = (["-l"], ["--list"])
 
 
+class PreflightError(RuntimeError):
+    """pr-discover is not usable yet, or refused the scope."""
+
+
+class PromptError(RuntimeError):
+    """./prompt.md could not be read, or has nothing in it."""
+
+
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="auto-review-pr-dashboard",
         description=(
             "Loop over open PRs and review each one with an AI CLI, one process per PR, "
             "with a dashboard showing progress, per-PR logs, and cancel / resume. Search scope "
-            "is specified via --repo-url, --pr-url, --author, and --reviewer flags."
+            "is specified via --repo-url, --pr-url, --author, and --reviewer flags, which "
+            "go to pr-discover unchanged; it must be on PATH."
         ),
         epilog=USAGE_EXAMPLES,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -142,37 +152,28 @@ def get_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def get_scope_flags(parser, args) -> tuple[list[str], list[str]]:
-    """Normalise --repo-url to `owner/repo` and reject anything unusable.
+def get_prompt() -> str:
+    """The whole of ./prompt.md, created with `code review` when absent.
 
-    Everything downstream builds paths from these - `repos/<repo>/pulls/...` for
-    `gh api`, and the per-PR log file name - so a url reaching them silently
-    corrupts both. Fail here, before the dashboard takes over the terminal.
+    Called after preflight, so a refused preflight never creates the file.
     """
-    from .gh import get_pr_url_parts, get_repo_slug
+    prompt_path = Path.cwd() / "prompt.md"
+    try:
+        prompt = prompt_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        try:
+            prompt_path.write_text("code review\n", encoding="utf-8")
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as error:
+            raise PromptError(
+                f"prompt.md could not be created or read: {error}"
+            ) from error
+    except (OSError, UnicodeError) as error:
+        raise PromptError(f"prompt.md could not be read: {error}") from error
 
-    repos: list[str] = []
-    for value in args.repo_url:
-        slug = get_repo_slug(value)
-        if slug is None:
-            parser.error(
-                f"--repo-url {value!r} is not a repository; use owner/repo or "
-                "https://github.com/owner/repo (a pull request url goes to --pr-url)"
-            )
-        if slug not in repos:
-            repos.append(slug)
-
-    urls: list[str] = []
-    for value in args.pr_url:
-        if get_pr_url_parts(value) is None:
-            parser.error(
-                f"--pr-url {value!r} is not a pull request url; expected "
-                "https://github.com/owner/repo/pull/<number>"
-            )
-        if value not in urls:
-            urls.append(value)
-
-    return repos, urls
+    if not prompt.strip():
+        raise PromptError("prompt.md must not be empty or whitespace-only")
+    return prompt
 
 
 def parse_args(argv: list[str] | None = None) -> RunConfig | None:
@@ -205,26 +206,7 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
     except UnsupportedAiCliError as error:
         parser.error(str(error))
 
-    prompt_path = Path.cwd() / "prompt.md"
-    try:
-        prompt = prompt_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        try:
-            prompt_path.write_text("code review\n", encoding="utf-8")
-            prompt = prompt_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
-            parser.error(f"prompt.md could not be created or read: {error}")
-    except (OSError, UnicodeError) as error:
-        parser.error(f"prompt.md could not be read: {error}")
-
-    if not prompt.strip():
-        parser.error("prompt.md must not be empty or whitespace-only")
-    if not args.repo_url and not args.pr_url:
-        parser.error("at least one of --repo-url or --pr-url is required")
-    if args.repo_url and not args.author:
-        parser.error(
-            "--author is required when using --repo-url (at least one author must be specified to search for PRs)"
-        )
+    # Scope values are not validated here: pr-discover checks them and says why.
     if args.interval < 1:
         parser.error("--interval must be a positive integer")
     if args.pr_timeout < 1:
@@ -234,13 +216,12 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
     if args.parallel < 1:
         parser.error("--parallel must be a positive integer")
 
-    repos, urls = get_scope_flags(parser, args)
-
     return RunConfig(
         ai_cli=args.ai_cli,
-        prompt=prompt,
-        repos=repos,
-        urls=urls,
+        # main reads prompt.md after preflight: a refused preflight leaves none.
+        prompt="",
+        repos=args.repo_url,
+        urls=args.pr_url,
         authors=args.author,
         reviewers=args.reviewer,
         interval_min=args.interval,
@@ -252,13 +233,18 @@ def parse_args(argv: list[str] | None = None) -> RunConfig | None:
     )
 
 
-async def print_dry_run(config: RunConfig) -> int:
-    """Discover PRs and print the verdict table, without starting any AI process."""
-    from .gh import discover_pr_items
+def run_preflight(config: RunConfig) -> None:
+    """Run pr-discover once, so a bad scope or a missing CLI stops the start."""
+    try:
+        discover_prs(config)
+    except DiscoverError as error:
+        raise PreflightError(f"pr-discover is not usable: {error}") from error
 
-    if not config.repos and not config.urls:
-        print("no scope specified", file=sys.stderr)
-        return 1
+
+def print_dry_run(config: RunConfig) -> int:
+    """Discover PRs and print the verdict table, without starting any AI process."""
+    from .runner import LoopRunner
+    from .store import Store
 
     print()
     print(f"repos     : {', '.join(config.repos) or '(none)'}")
@@ -267,7 +253,7 @@ async def print_dry_run(config: RunConfig) -> int:
     print(f"urls      : {', '.join(config.urls) or '(none)'}")
     print()
 
-    items = discover_pr_items(config)
+    items = LoopRunner(config, Store()).build_items()
     if not items:
         print("no candidate PR found")
         return 0
@@ -275,27 +261,31 @@ async def print_dry_run(config: RunConfig) -> int:
     key_width = max(len(item.key) for item in items)
     for item in items:
         title = item.title if len(item.title) <= 48 else item.title[:47] + "\u2026"
-        print(
-            f"{item.key:<{key_width}}  {item.verdict_label:<11}  "
-            f"head {item.short_head}  {title}"
-        )
+        # A failed PR's marker is unknown, so it has no verdict to show.
+        is_failed = item.state is PrState.FAILED
+        label = PrState.FAILED.value if is_failed else item.verdict_label
+        print(f"{item.key:<{key_width}}  {label:<11}  head {item.short_head}  {title}")
         print(f"{'':<{key_width}}  matched: {', '.join(item.matched_axes)}")
+        if is_failed:
+            print(f"{'':<{key_width}}  {item.error}")
 
-    queued = sum(1 for item in items if item.verdict is not Verdict.SKIP)
+    decided = [item for item in items if item.state is not PrState.FAILED]
+    failed = len(items) - len(decided)
+    queued = sum(1 for item in decided if item.verdict is not Verdict.SKIP)
     print()
     print(
         f"scanned {len(items)} \u2014 "
-        f"Full {sum(1 for i in items if i.verdict is Verdict.FULL)} / "
-        f"Incremental {sum(1 for i in items if i.verdict is Verdict.INCREMENTAL)} / "
-        f"Skip {sum(1 for i in items if i.verdict is Verdict.SKIP)}; "
-        f"{queued} would be reviewed"
+        f"Full {sum(1 for i in decided if i.verdict is Verdict.FULL)} / "
+        f"Incremental {sum(1 for i in decided if i.verdict is Verdict.INCREMENTAL)} / "
+        f"Skip {sum(1 for i in decided if i.verdict is Verdict.SKIP)}; "
+        f"{queued} would be reviewed, {failed} failed"
     )
-    return 0
+    return 1 if failed else 0
 
 
 def print_workspaces() -> int:
     """List the working directories whose daemon is still attachable."""
-    from .session import get_live_workspaces
+    from .daemon import get_live_workspaces
     from .stats import format_duration
 
     workspaces = get_live_workspaces()
@@ -325,8 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     if raw_args in LIST_ARGV:
         return print_workspaces()
 
-    from .session import (
-        SessionClient,
+    from .client import SessionClient
+    from .daemon import (
         SessionError,
         get_resume_metadata,
         start_daemon,
@@ -341,27 +331,19 @@ def main(argv: list[str] | None = None) -> int:
             metadata = get_resume_metadata(store)
             config = RunConfig(**metadata.config)
         else:
-            metadata = start_daemon(config, store) if not config.dry_run else None
-    except SessionError as error:
-        print(f"auto-review-pr-dashboard: {error}", file=sys.stderr)
-        return 1
-
-    from .gh import GhError
-
-    try:
-        if config.dry_run:
-            return asyncio.run(print_dry_run(config))
-    except GhError as error:
+            run_preflight(config)
+            config.prompt = get_prompt()
+            if config.dry_run:
+                return print_dry_run(config)
+            metadata = start_daemon(config, store)
+    except (PreflightError, PromptError, GhError, DiscoverError, SessionError) as error:
         print(f"auto-review-pr-dashboard: {error}", file=sys.stderr)
         return 1
 
     from .app import AutoReviewPrDashboardApp
 
-    result = AutoReviewPrDashboardApp(
-        config,
-        store=store,
-        session=SessionClient(metadata),
-    ).run()
+    app = AutoReviewPrDashboardApp(config, store=store, session=SessionClient(metadata))
+    result = app.run()
     if result == "background":
         print(
             "auto-review-pr-dashboard: running in background; "
@@ -372,6 +354,8 @@ def main(argv: list[str] | None = None) -> int:
             "auto-review-pr-dashboard: this dashboard was replaced by a newer --resume"
         )
     elif result in ("connection-error", "disconnected"):
+        # The app records why the connection died; only here can it be read.
+        print(f"auto-review-pr-dashboard: {app.exit_message}", file=sys.stderr)
         return 1
     return 0
 

@@ -14,10 +14,11 @@ tool behaves a certain way.
 | dashboard / TUI | the screen in your terminal; it's only the daemon's screen, so closing it stops nothing |
 | `ai_cli` | the AI CLI you use. `codex`, `claude`, `pi`, and `opencode` are supported, and so are names with a `-xxx` suffix such as `codex-personal` |
 | agent | the AI process that actually reviews one PR |
+| `pr-discover` | a separate CLI this tool uses to search for PRs |
 | `prompt.md` | the review instructions for the agent; the whole file is the prompt |
 | round (loop) | one pass: find PRs, then review everything that needs it |
 | marker | a hidden comment the agent leaves on the PR when it finishes, like a bookmark recording which commit was reviewed |
-| `Full` / `Incremental` / `Skip` | this round's call on a PR: never reviewed / reviewed, but the head has moved since / current head already reviewed |
+| `Full` / `Incremental` / `Skip` / `Unknown` | this round's call on a PR: never reviewed / reviewed, but the head has moved since / current head already reviewed / the PR could not be read, so there is no call |
 | cooldown | the time the whole round waits after hitting a usage limit |
 | shift change (recycle) | the daemon periodically hands its work to a fresh daemon |
 | process group | a process plus the child processes it started; they get killed together |
@@ -45,29 +46,48 @@ Every make target:
 | Target | What it does |
 |---|---|
 | `make` | runs `uv sync`: dependencies only, into the local `.venv` |
-| `make install` | installs the CLI and the shell wrapper |
+| `make install` | installs the CLI and the shell wrapper. Before this or any other reinstall, press `q` in the dashboard to stop the daemon: a running daemon keeps its old code, its next shift change starts the successor from the newly installed files, and if the two don't fit, the shift change fails and the daemon ends, with the reason in `daemon.log` |
 | `make uninstall` | removes both, including the daemon socket directory. It refuses while the daemon is running, so press `q` in the dashboard first, or force it with `FORCE=1`. It leaves `.tmp/auto-review-pr-dashboard/` alone, and removes the symlink only if it still points at this repo |
 | `make test` | runs the tests in the uv environment |
 | `make clean` | removes `.venv`, `__pycache__`, and the generated `requirements.txt` |
 | `make requirements` | optional: generates a pinned `requirements.txt` from `uv.lock` |
 
+To install `pr-discover` from source instead of the AppImage, clone
+[pr-discover](https://github.com/scott1028/pr-discover) and run `make install` in its
+directory. That needs Python 3.10 or newer and uv, and puts `pr-discover` on your `PATH`.
+
 ## What each loop round does
 
 Every round follows the same four steps:
 
-1. **Find PRs.** The tool calls `gh pr list` once per search condition: once per
-   `--author`, and for each reviewer once with `review-requested:` and once with
-   `reviewed-by:`. The results are merged and deduplicated. The calls are separate because
-   GitHub ANDs every condition inside one `--search`. If you give both kinds of scope, a
-   PR matching either side is kept.
-2. **Decide whether to review.** A Draft, or a PR with `[WIP]` / `WIP:` in its title,
-   becomes `Skip (WIP)` right away. For the rest, the tool runs
-   `gh pr view --json headRefOid,comments` and finds the newest
-   `<!-- review-pr-branches: head=<sha> -->` marker: no marker means `Full`, a marker SHA
-   that differs from the current head means `Incremental`, and a matching one means
-   `Skip`. `Skip` PRs still show up; they just never get an agent.
+1. **Find PRs.** `pr-discover` does this. The tool runs it once per round, and once at
+   startup to check the scope.
+   - The tool never passes `--`, so every run is a dry run: it dispatches nothing and
+     never writes its own state.
+   - The search, Drafts, and `[WIP]` / `WIP:` titles are all its call. Each `--reviewer`
+     is searched once with `review-requested:` and once with `reviewed-by:`.
+   - With both `--author` and `--reviewer`, a PR has to match both; a PR named by
+     `--pr-url` is always kept.
+   - The `matched:` line in the `--dry-run` table and on the detail page is its
+     `matched_axes`: the search conditions that found the PR. An older `pr-discover`
+     without that field leaves the line empty (`-` on the detail page).
+   - The whole `pr-discover` run gets `DISCOVER_TIMEOUT_SEC` (120s, in `discover.py`).
+     That limit covers the entire run, not each `gh` call.
+2. **Decide whether to review.** Every PR gets one
+   `gh pr view --json title,author,headRefOid,comments`, and its title, author, and head
+   come from that.
+   - A PR `pr-discover` called a Draft or WIP becomes `Skip (WIP)` right away.
+   - For the rest, the tool finds the newest `<!-- review-pr-branches: head=<sha> -->`
+     marker: no marker means `Full`, a marker SHA that differs from the current head means
+     `Incremental`, and a matching one means `Skip`. `Skip` PRs still show up; they just
+     never get an agent.
+   - When `gh pr view` fails for one PR, only that PR fails, and its verdict shows
+     `Unknown`; a PR `pr-discover` already skipped stays skipped.
+   - Each `gh` call gets `GH_TIMEOUT_SEC` (120s, in `gate.py`).
 3. **Review.** Each remaining PR gets its own agent, at most `--parallel` at a time,
-   following `prompt.md`.
+   following `prompt.md`. `--pr-timeout` covers the agent itself; once it exits, its
+   output gets `OUTPUT_DRAIN_SEC` (2s, in `runner.py`) to drain, then the whole process
+   group gets SIGKILL, so a child the agent left behind can't hold the PR up.
 4. **Record what was posted.** Before and after each run, the tool snapshots the ids of
    every comment on the PR; comparing the two shows what's new. This trusts GitHub, not
    the agent's output. Only comments carrying the `review-pr-branches` marker count, so
@@ -117,10 +137,11 @@ and hands the loop state to its successor via stdin. The TUI waits for a new `ru
 
 ## Limits and edge cases
 
-- If the daemon dies without cleaning up, its agents keep running. On the next start, the
-  tool kills those process groups using `agent_groups` in `daemon.json`, skipping any pid
-  that another process has since reused. A descendant that called `setsid` itself is out
-  of reach.
+- A daemon that crashes on an exception still stops every agent and writes the traceback
+  to `daemon.log`. If the daemon dies without a chance to clean up (a SIGKILL, say), its
+  agents keep running. On the next start, the tool kills those process groups using
+  `agent_groups` in `daemon.json`, skipping any pid that another process has since
+  reused. A descendant that called `setsid` itself is out of reach.
 - The log panel is an in-memory view with limits; the full text is in the `.log` file. A
   line over 2000 characters shows only its first 2000, followed by `(+N chars)`.
 - The panel keeps the last 2000 lines, and only running PRs keep buffering. In the `.log`
@@ -130,7 +151,7 @@ and hands the loop state to its successor via stdin. The TUI waits for a new `ru
 ## Tests and releases
 
 ```bash
-make test                               # 145 tests, no network
+make test                               # 237 tests, no network
 python3 -m unittest discover -s tests   # same, without uv
 ```
 

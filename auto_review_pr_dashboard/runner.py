@@ -12,15 +12,19 @@ import signal
 import subprocess
 import time
 from collections import deque
-
+from contextlib import suppress
 from dataclasses import dataclass, field
 
-from . import gh
+from . import gate
 from .config import RunConfig, get_ai_command, get_is_usage_limit
-from .models import LoopRecord, PrItem, PrState, Verdict
+from .discover import DiscoveredPr, DiscoverError, discover_prs
+from .models import LoopRecord, PrItem, PrState, SkipReason, Verdict
 from .store import Store
 
 TERMINATE_GRACE_SEC = 5
+# After the leader exits, output gets this long to drain before stragglers
+# holding the pipe open are SIGKILLed.
+OUTPUT_DRAIN_SEC = 2
 OUTPUT_TAIL_LINES = 20
 ERROR_TAIL_LINES = 3
 # Agent output is read in chunks and split here: readline() raises past asyncio's
@@ -50,6 +54,15 @@ class AgentRun:
         return self.timed_out or self.exit_code != 0
 
 
+def get_is_group_alive(pgid: int) -> bool:
+    """Any process left in the group? A not-yet-reaped leader keeps it alive."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
 class LoopRunner:
     def __init__(
         self,
@@ -64,7 +77,9 @@ class LoopRunner:
         # None = never recycle, which is what the in-process dashboard does.
         self.recycle_every_loops = recycle_every_loops
 
-        self.loop_index = 0
+        # Continue where the last daemon left off, so loop numbers are never
+        # reused after a restart. A recycle's handoff overrides this.
+        self.loop_index = store.load_loop_index()
         self.record: LoopRecord | None = None
         self.queue: deque[str] = deque()
         self.paused = False
@@ -80,6 +95,8 @@ class LoopRunner:
         self._running_keys: list[str] = []
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._cancelled_keys: set[str] = set()
+        # Agent gone, result being decided: cancel() is too late for these.
+        self._finishing_keys: set[str] = set()
         # The one escalation task per process, kept referenced so it is not
         # garbage-collected before it runs.
         self._stop_tasks: dict[asyncio.subprocess.Process, asyncio.Task] = {}
@@ -117,6 +134,12 @@ class LoopRunner:
         item = self.record.item_by_key(key) if self.record else None
         if item is None or item.state not in (PrState.QUEUED, PrState.RUNNING):
             return False
+        process = self._processes.get(key)
+        if key in self._finishing_keys or (
+            process is not None and process.returncode is not None
+        ):
+            # The agent is gone already: its result is decided now, not undone.
+            return False
 
         self._cancelled_keys.add(key)
         if item.state is PrState.QUEUED:
@@ -125,7 +148,6 @@ class LoopRunner:
             self.emit("item_update", item)
             return True
 
-        process = self._processes.get(key)
         if process is not None:
             item.error = "cancel requested"
             self.emit("item_update", item)
@@ -213,20 +235,13 @@ class LoopRunner:
         self.store.prune_logs()
         self.emit("loop_start", self.loop_index)
 
-        if not self.validate_scope():
+        try:
+            items = await asyncio.to_thread(self.build_items)
+        except (gate.GhError, DiscoverError) as error:
+            # A dead gh or a broken pr-discover is a loop-level failure: the
+            # next loop may succeed, so use no items instead of killing the run.
+            self.emit("error", f"discovery failed: {error}")
             items = []
-        else:
-            try:
-                items = await asyncio.to_thread(
-                    gh.discover_pr_items,
-                    self.config,
-                    lambda done, total, item: self.emit(
-                        "discovery_progress", done, total, item
-                    ),
-                )
-            except gh.GhError as error:
-                self.emit("error", f"discovery failed: {error}")
-                items = []
 
         self.record.items = items
         self.queue = deque(item.key for item in items if item.state is PrState.QUEUED)
@@ -239,6 +254,24 @@ class LoopRunner:
         self.store.save_loop(self.record)
         self.emit("loop_end", self.record)
         return self.record
+
+    # ---- building items -----------------------------------------------------
+
+    def build_items(self) -> list[PrItem]:
+        """Discover, then read every PR's title and marker.
+
+        Runs in a worker thread; every call inside is synchronous gh work. PRs
+        pr-discover skipped are read too, so their title and marker still show.
+        """
+        discovered = discover_prs(self.config)
+        items = []
+        for done, found in enumerate(discovered, start=1):
+            item = _build_gated_item(found)
+            items.append(item)
+            self.emit("discovery_progress", done, len(discovered), item)
+        return items
+
+    # ---- queue --------------------------------------------------------------
 
     async def _run_queue(self) -> None:
         """Start queued PRs while a slot is free, until nothing is queued or running."""
@@ -267,10 +300,12 @@ class LoopRunner:
                 if item is None or item.state is not PrState.QUEUED:
                     continue
                 running.add(asyncio.create_task(self._run_item(item)))
-        except Exception:
-            # Agents live in their own process groups: never leave them behind.
+        except BaseException:
+            # asyncio.CancelledError of the loop task included: agents live in
+            # their own process groups and must never be left behind.
             self.stop()
-            await asyncio.gather(*running, return_exceptions=True)
+            with suppress(asyncio.CancelledError):
+                await asyncio.gather(*running, return_exceptions=True)
             raise
 
     async def _wait_until_runnable(self) -> None:
@@ -287,15 +322,6 @@ class LoopRunner:
     async def _wait_while_paused(self) -> None:
         while self.paused and not self._stopped:
             await asyncio.sleep(0.2)
-
-    # ---- scope validation ---------------------------------------------------
-
-    def validate_scope(self) -> bool:
-        """Validate that CLI-provided scope is usable. False = skip this loop."""
-        if not self.config.repos and not self.config.urls:
-            self.emit("error", "no --repo-url or --pr-url specified")
-            return False
-        return True
 
     # ---- usage limit / systemic block ---------------------------------------
 
@@ -365,12 +391,6 @@ class LoopRunner:
 
     async def _spawn_agent(self, command, log_path, timeout_sec, log_key) -> AgentRun:
         """Run one agent process, streaming its output to a log file."""
-        output_tail: deque[str] = deque(maxlen=OUTPUT_TAIL_LINES)
-        error = ""
-        exit_code = None
-        timed_out = False
-        is_spawned = False
-
         # Opened before the spawn, so a log that cannot be written is reported as
         # itself instead of being blamed on the agent binary.
         try:
@@ -379,53 +399,110 @@ class LoopRunner:
             return AgentRun(
                 exit_code=1, error=f"cannot open log {log_path}: {os_error}"
             )
-
         try:
-            with log_file:
-                log_file.write(f"$ {' '.join(command[:-1])} <prompt>\n")
-                process = await asyncio.create_subprocess_exec(
-                    *command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                self._processes[log_key] = process
-                is_spawned = True
-                # The daemon records the group so a crash cannot orphan this agent.
-                self.emit("agent_started", process.pid)
-                if self._stopped or log_key in self._cancelled_keys:
-                    # q or c landed before there was a process to signal.
-                    self._schedule_stop(process)
-                try:
-                    await asyncio.wait_for(
-                        self._pump_output(process, log_key, log_file, output_tail),
-                        timeout=timeout_sec,
-                    )
-                except asyncio.TimeoutError:
-                    timed_out = True
-                    error = f"timed out after {round(timeout_sec / 60)}min"
-                    await self._stop_process(process)
-                except Exception as pump_error:
-                    # This coroutine runs as a Textual worker: an escaping error
-                    # takes the whole app down and leaves the agent alive in its
-                    # own process group. Fail just this PR instead.
-                    error = f"reading agent output failed: {pump_error}"
-                    await self._stop_process(process)
-                exit_code = await process.wait()
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
         except FileNotFoundError:
+            self._close_log(log_file)
             # The command always execs `bash`, so this is bash missing - a real
             # "<ai_cli>: command not found" comes back as bash's own exit 127.
-            error = f"cannot start {self.config.ai_cli}: bash not found"
-            exit_code = 127
+            return AgentRun(
+                exit_code=127,
+                error=f"cannot start {self.config.ai_cli}: bash not found",
+            )
         except OSError as os_error:
-            error = str(os_error)
-            exit_code = 1
-        finally:
-            if is_spawned:
-                del self._processes[log_key]
-                self._stop_tasks.pop(process, None)
-                self.emit("agent_finished", process.pid)
+            self._close_log(log_file)
+            return AgentRun(exit_code=1, error=str(os_error))
 
+        self._processes[log_key] = process
+        try:
+            return await self._await_agent(
+                process, command, log_file, log_key, timeout_sec
+            )
+        finally:
+            del self._processes[log_key]
+            self._stop_tasks.pop(process, None)
+            self.emit("agent_finished", process.pid)
+
+    async def _await_agent(
+        self, process, command, log_file, log_key, timeout_sec
+    ) -> AgentRun:
+        output_tail: deque[str] = deque(maxlen=OUTPUT_TAIL_LINES)
+        pump_task = asyncio.create_task(
+            self._pump_output(process, log_key, log_file, output_tail, command)
+        )
+        wait_task = asyncio.create_task(self._await_exit(process))
+        run: AgentRun | None = None
+        try:
+            # Inside the guard: a listener that raises must not leave the group
+            # alive and unregistered. The daemon records the group from this.
+            self.emit("agent_started", process.pid)
+            if self._stopped or log_key in self._cancelled_keys:
+                # q or c landed before there was a process to signal.
+                self._schedule_stop(process)
+            run = await self._collect_agent(
+                process, pump_task, wait_task, output_tail, timeout_sec
+            )
+            return run
+        except BaseException:
+            # Left by an exception, CancelledError included. The SIGKILL is
+            # synchronous, so no agent can outlive this coroutine.
+            self._terminate(process, signal.SIGKILL)
+            pump_task.cancel()
+            await asyncio.gather(pump_task, wait_task, return_exceptions=True)
+            raise
+        finally:
+            close_error = self._close_log(log_file)
+            if run is not None and close_error:
+                run.error = f"{run.error} {close_error}".strip()
+                run.exit_code = run.exit_code or 1
+
+    def _close_log(self, log_file) -> str:
+        """Close the log; a failure is reported, never raised out of a run."""
+        try:
+            log_file.close()
+        except OSError as os_error:
+            return f"closing the log failed: {os_error}"
+        return ""
+
+    async def _collect_agent(
+        self, process, pump_task, wait_task, output_tail, timeout_sec
+    ) -> AgentRun:
+        """The timeout covers the process; the log gets a short drain after it."""
+        error = ""
+        timed_out = False
+        exit_code = None
+        deadline = time.monotonic() + timeout_sec
+        pending = {wait_task, pump_task}
+        while pending and exit_code is None:
+            done, pending = await asyncio.wait(
+                pending,
+                timeout=max(0.0, deadline - time.monotonic()),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                timed_out = True
+                error = f"timed out after {round(timeout_sec / 60)}min"
+                await self._stop_process(process)
+                break
+            if pump_task in done and pump_task.exception() is not None:
+                # The log broke: stop the agent now, not whenever it exits.
+                self._terminate(process, signal.SIGKILL)
+                break
+            if wait_task in done:
+                exit_code = wait_task.result()
+        if exit_code is None:
+            exit_code = await wait_task
+        log_error = await self._drain_output(process, pump_task)
+        if log_error:
+            error = f"{error} {log_error}".strip()
+            # A log that cannot be written is a failure even when the agent
+            # itself exited 0, so it is never judged DONE.
+            exit_code = exit_code or 1
         return AgentRun(
             exit_code=exit_code,
             output_tail=output_tail,
@@ -433,15 +510,73 @@ class LoopRunner:
             timed_out=timed_out,
         )
 
+    async def _await_exit(self, process) -> int:
+        """The leader's exit code, without asyncio's wait().
+
+        wait() also waits for the stdout pipe to close, which a surviving
+        child can hold open for hours - the process timeout is about the
+        leader, not its stragglers. asyncio's child watcher reaps the leader
+        and fills in returncode regardless of the pipe.
+        """
+        while process.returncode is None:
+            await asyncio.sleep(0.05)
+        return process.returncode
+
+    async def _drain_output(self, process, pump_task) -> str:
+        """Leader gone: give output OUTPUT_DRAIN_SEC, then always clear stragglers.
+
+        Returns the log error when the pump broke, at any point.
+        """
+        if not pump_task.done():
+            # A surviving child holds the pipe open; the leader's exit code
+            # already stands, so this wait is bounded. `wait` never re-raises
+            # what the pump hit: the `await` below turns that into log_error.
+            await asyncio.wait({pump_task}, timeout=OUTPUT_DRAIN_SEC)
+        if not pump_task.done():
+            pump_task.cancel()
+        log_error = ""
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as pump_error:
+            log_error = f"writing log failed: {pump_error}"
+        # Kill unconditionally: a detached child that outlived the leader is
+        # still ours, and nothing may run past the loop.
+        self._terminate(process, signal.SIGKILL)
+        return log_error
+
     async def _run_item(self, item: PrItem) -> None:
+        if item.key in self._cancelled_keys:
+            # Cancelled between the queue check and this task's start: never
+            # spawn for it.
+            item.state = PrState.CANCELLED
+            if not item.error:
+                item.error = "cancelled by user"
+            self.emit("item_update", item)
+            return
         item.state = PrState.RUNNING
         item.error = ""
+        # A resumed PR inherits the last run's finish time; leaving it set makes
+        # the running duration read as negative until this run finishes.
+        item.finished_at = None
+        item.exit_code = None
         item.started_at = time.time()
         item.log_path = str(self.store.get_log_path(self.loop_index, item))
         self._running_keys.append(item.key)
         self.emit("item_update", item)
 
         before = await self._snapshot(item)
+        if item.key in self._cancelled_keys:
+            # Cancelled while the pre-run snapshot ran: there is still no
+            # process, so end here instead of spawning one only to stop it.
+            self._running_keys.remove(item.key)
+            item.state = PrState.CANCELLED
+            item.finished_at = time.time()
+            if not item.error:
+                item.error = "cancelled by user"
+            self.emit("item_update", item)
+            return
         command = get_ai_command(
             self.config.ai_cli,
             self.config.prompt,
@@ -459,14 +594,18 @@ class LoopRunner:
         finally:
             self._running_keys.remove(item.key)
         item.exit_code = run.exit_code
+        self._finishing_keys.add(item.key)
 
         after = await self._snapshot(item)
         # Without both snapshots, what the agent posted is unknown.
         is_posting_unknown = before is None or after is None
         item.new_posts = (
-            [] if is_posting_unknown else gh.classify_new_posts(before, after)
+            [] if is_posting_unknown else gate.classify_new_posts(before, after)
         )
         item.finished_at = time.time()
+        # cancel() refused once the agent was gone, so a key still in
+        # _cancelled_keys means the cancel took effect.
+        self._finishing_keys.discard(item.key)
 
         if item.key in self._cancelled_keys:
             item.state = PrState.CANCELLED
@@ -550,18 +689,22 @@ class LoopRunner:
     async def _snapshot(self, item: PrItem) -> dict | None:
         """The PR's comments by id, or None when gh could not fetch them."""
         try:
-            return await asyncio.to_thread(gh.snapshot_comments, item.repo, item.number)
-        except (gh.GhError, subprocess.SubprocessError, OSError) as error:
+            return await asyncio.to_thread(gate.snapshot_comments, item.repo, item.number)
+        except (gate.GhError, subprocess.SubprocessError, OSError) as error:
             # A gh timeout or a missing gh fails this snapshot, not the whole loop.
             self.emit("error", f"{item.key}: comment snapshot failed: {error}")
             return None
 
-    async def _pump_output(self, process, log_key, log_file, output_tail) -> None:
+    async def _pump_output(self, process, log_key, log_file, output_tail, command) -> None:
         """Stream the agent's output, splitting lines ourselves.
 
-        `read()` has no separator limit, so a line longer than asyncio's own
-        readline() limit is data rather than a crash.
+        Starts with the command header, so a log write failure is seen by the
+        caller, which stops the agent instead of blaming it. `read()` has no
+        separator limit, so a line longer than asyncio's own readline() limit
+        is data rather than a crash.
         """
+        log_file.write(f"$ {' '.join(command[:-1])} <prompt>\n")
+        log_file.flush()
         pending = b""
         while True:
             chunk = await process.stdout.read(READ_CHUNK_BYTES)
@@ -591,22 +734,65 @@ class LoopRunner:
             self.emit("log", log_key, short_line)
 
     async def _stop_process(self, process) -> None:
+        """SIGTERM the group; SIGKILL it if anything outlives the grace."""
         self._terminate(process, signal.SIGTERM)
-        try:
-            await asyncio.wait_for(process.wait(), timeout=TERMINATE_GRACE_SEC)
-        except asyncio.TimeoutError:
-            self._terminate(process, signal.SIGKILL)
+        deadline = time.monotonic() + TERMINATE_GRACE_SEC
+        while time.monotonic() < deadline:
+            if not get_is_group_alive(process.pid):
+                return
+            await asyncio.sleep(0.1)
+        self._terminate(process, signal.SIGKILL)
 
     def _terminate(self, process, sig) -> None:
-        if process.returncode is not None:
-            return
+        # start_new_session=True makes the agent its own group leader, so the
+        # pgid is its pid even once the leader has exited - the signal must
+        # still reach surviving children.
         try:
-            os.killpg(os.getpgid(process.pid), sig)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _build_gated_item(found: DiscoveredPr) -> PrItem:
+    item = PrItem(
+        repo=found.repo,
+        number=found.number,
+        url=found.url,
+        title="",
+        author="",
+        head_sha=found.head_sha,
+        matched_axes=found.matched_axes,
+    )
+    try:
+        snapshot = gate.get_gate_snapshot(item.url)
+    except gate.GhError as error:
+        if found.skip_reason is not None:
+            # pr-discover already skipped it; the snapshot only fills in its title.
+            item.verdict = Verdict.SKIP
+            item.state = PrState.SKIP
+            item.skip_reason = found.skip_reason
+            return item
+        # One unreachable PR must not stop the others.
+        item.state = PrState.FAILED
+        item.verdict = Verdict.UNKNOWN
+        item.error = f"gate check failed: {error}"
+        return item
+
+    item.title = snapshot.title
+    item.author = snapshot.author
+    item.head_sha = snapshot.head_sha
+    item.last_marker_sha = snapshot.marker_sha
+    if found.skip_reason is not None:
+        item.verdict = Verdict.SKIP
+        item.state = PrState.SKIP
+        item.skip_reason = found.skip_reason
+        return item
+
+    item.verdict = gate.decide_verdict(snapshot.head_sha, snapshot.marker_sha)
+    if item.verdict is Verdict.SKIP:
+        item.state = PrState.SKIP
+        item.skip_reason = SkipReason.HEAD_ALREADY_REVIEWED
+    return item
 
 
 def get_truncated_line(line: str) -> str:

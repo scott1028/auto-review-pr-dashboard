@@ -4,18 +4,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
-from io import StringIO
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from auto_review_pr_dashboard.__main__ import get_parser, parse_args
+from auto_review_pr_dashboard.__main__ import (
+    PromptError,
+    get_parser,
+    get_prompt,
+    parse_args,
+)
 from auto_review_pr_dashboard.config import (
     AI_CLI_FLAGS,
     SUPPORTED_AI_CLIS,
     RunConfig,
     UnsupportedAiCliError,
+    get_agent_command,
     get_ai_cli_family,
     get_ai_command,
     get_is_usage_limit,
@@ -91,6 +95,21 @@ class ConfigParityTest(unittest.TestCase):
         self.assertEqual(command[4:-1], [*AI_CLI_FLAGS["codex"], "--yolo"])
         self.assertIn("https://x/pull/7", command[-1])
 
+    def test_plain_opencode_gets_bare_run(self):
+        command = get_agent_command("opencode", "PROMPT", [])
+        self.assertEqual(
+            command, ["bash", "-ic", '"$0" "$@"', "opencode", "run", "PROMPT"]
+        )
+
+    def test_opencode_variant_gets_dashdash_run(self):
+        # agent-switch wrappers like opencode-local parse `run` themselves
+        # unless it follows `--`
+        command = get_agent_command("opencode-local", "PROMPT", [])
+        self.assertEqual(
+            command,
+            ["bash", "-ic", '"$0" "$@"', "opencode-local", "--", "run", "PROMPT"],
+        )
+
     def test_scoped_prompt_contract(self):
         prompt = get_scoped_prompt(
             "review my open PRs", "owner/repo", "https://github.com/owner/repo/pull/7"
@@ -142,22 +161,15 @@ class ConfigParityTest(unittest.TestCase):
             previous_cwd = Path.cwd()
             try:
                 os.chdir(tmp_dir)
-                config = parse_args(
-                    [
-                        "codex",
-                        "ignored positional prompt",
-                        "--pr-url",
-                        "https://github.com/o/r/pull/7",
-                    ]
-                )
+                prompt_text = get_prompt()
                 prompt_path.write_text("changed after startup", encoding="utf-8")
             finally:
                 os.chdir(previous_cwd)
 
-        self.assertEqual(config.prompt, prompt_file_content)
+        self.assertEqual(prompt_text, prompt_file_content)
         prompt = get_ai_command(
-            config.ai_cli,
-            config.prompt,
+            "codex",
+            prompt_text,
             "o/r",
             "https://github.com/o/r/pull/7",
         )[-1]
@@ -173,10 +185,12 @@ class ConfigParityTest(unittest.TestCase):
                 config = parse_args(
                     ["claude", "--pr-url", "https://github.com/o/r/pull/7"]
                 )
+                prompt_text = get_prompt()
             finally:
                 os.chdir(previous_cwd)
 
-        self.assertEqual(config.prompt, "/custom-review")
+        self.assertEqual(config.prompt, "")
+        self.assertEqual(prompt_text, "/custom-review")
 
     def test_prompt_file_validation_and_read_error(self):
         cases = (("", "must not be empty"), (" \n\t", "must not be empty"))
@@ -184,30 +198,24 @@ class ConfigParityTest(unittest.TestCase):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as tmp_dir:
                 (Path(tmp_dir) / "prompt.md").write_text(content, encoding="utf-8")
                 previous_cwd = Path.cwd()
-                stderr = StringIO()
                 try:
                     os.chdir(tmp_dir)
-                    with redirect_stderr(stderr), self.assertRaises(SystemExit):
-                        parse_args(
-                            ["codex", "--pr-url", "https://github.com/o/r/pull/7"]
-                        )
+                    with self.assertRaises(PromptError) as caught:
+                        get_prompt()
                 finally:
                     os.chdir(previous_cwd)
-                self.assertIn(expected_error, stderr.getvalue())
+                self.assertIn(expected_error, str(caught.exception))
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             (Path(tmp_dir) / "prompt.md").mkdir()
             previous_cwd = Path.cwd()
-            stderr = StringIO()
             try:
                 os.chdir(tmp_dir)
-                with redirect_stderr(stderr), self.assertRaises(SystemExit):
-                    parse_args(
-                        ["codex", "--pr-url", "https://github.com/o/r/pull/7"]
-                    )
+                with self.assertRaises(PromptError) as caught:
+                    get_prompt()
             finally:
                 os.chdir(previous_cwd)
-            self.assertIn("prompt.md could not be read", stderr.getvalue())
+            self.assertIn("prompt.md could not be read", str(caught.exception))
 
     def test_missing_prompt_file_is_created_and_used(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -215,14 +223,12 @@ class ConfigParityTest(unittest.TestCase):
             previous_cwd = Path.cwd()
             try:
                 os.chdir(tmp_dir)
-                config = parse_args(
-                    ["codex", "--pr-url", "https://github.com/o/r/pull/7"]
-                )
+                prompt_text = get_prompt()
                 self.assertEqual(prompt_path.read_bytes(), b"code review\n")
             finally:
                 os.chdir(previous_cwd)
 
-        self.assertEqual(config.prompt, "code review\n")
+        self.assertEqual(prompt_text, "code review\n")
 
     def test_resume_does_not_read_prompt_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -283,7 +289,8 @@ class ConfigParityTest(unittest.TestCase):
         config = parse_args(
             shlex.split("codex 'review my PRs' --repo-url o/r --author me")
         )
-        self.assertEqual(config, RunConfig("codex", "code review\n", ["o/r"], ["me"]))
+        self.assertEqual(config, RunConfig("codex", "", ["o/r"], ["me"]))
+        self.assertFalse(Path("prompt.md").exists())
 
         config = parse_args(
             shlex.split(
@@ -337,8 +344,6 @@ class ConfigParityTest(unittest.TestCase):
             "--list --resume",
             "codex review --repo-url o/r --author me -l",
             "gemini p --repo-url o/r --author me",
-            "codex review",
-            "codex review --repo-url o/r",
             "codex p --interval 0 --repo-url o/r --author me",
             "codex p --pr-timeout -1 --repo-url o/r --author me",
             "codex p --cooldown 0 --repo-url o/r --author me",
@@ -347,21 +352,3 @@ class ConfigParityTest(unittest.TestCase):
         for argv in cases:
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 parse_args(shlex.split(argv))
-
-    def test_scope_normalization_matrix(self):
-        config = parse_args(
-            shlex.split(
-                "codex review --repo-url https://github.com/o/r2 "
-                "--repo-url o/r --repo-url https://github.com/o/r.git --author me"
-            )
-        )
-        self.assertEqual(config.repos, ["o/r2", "o/r"])
-        invalid = (
-            "--repo-url https://github.com/o/r/pull/7 --author me",
-            "--pr-url https://github.com/o/r",
-            "--pr-url o/r#7",
-            "--pr-url nonsense",
-        )
-        for scope in invalid:
-            with self.subTest(scope=scope), self.assertRaises(SystemExit):
-                parse_args(["codex", "review", *shlex.split(scope)])

@@ -74,16 +74,13 @@ def get_ai_command(ai_cli, prompt, repo, url, ai_cli_args=()):
 
 def get_agent_command(ai_cli, prompt, ai_cli_args):
     family = get_ai_cli_family(ai_cli)
+    flags = list(AI_CLI_FLAGS[family])
+    if family == "opencode" and ai_cli != "opencode":
+        # `opencode-<x>` are agent-switch wrapper functions; they reject a bare
+        # `run` as their own subcommand unless it follows `--`.
+        flags = ["--", *flags]
     # user args from `-- ...` go after the built-in flags, before the prompt
-    return [
-        "bash",
-        "-ic",
-        '"$0" "$@"',
-        ai_cli,
-        *AI_CLI_FLAGS[family],
-        *ai_cli_args,
-        prompt,
-    ]
+    return ["bash", "-ic", '"$0" "$@"', ai_cli, *flags, *ai_cli_args, prompt]
 
 
 # Matched against the tail of a failed agent run only (see get_is_usage_limit).

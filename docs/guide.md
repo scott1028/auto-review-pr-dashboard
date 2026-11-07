@@ -13,10 +13,11 @@
 | dashboard / TUI | 終端機上的畫面，只是 daemon 的螢幕，關掉不影響工作 |
 | `ai_cli` | 你要用的 AI CLI。支援 `codex`、`claude`、`pi`、`opencode`，也接受 `codex-personal` 這種後面加了 `-xxx` 的名字 |
 | agent | 實際去審某一個 PR 的 AI process |
+| `pr-discover` | 另一個 CLI，這個工具靠它搜尋 PR |
 | `prompt.md` | 給 agent 的審查指示，整個檔案就是 prompt |
 | 一輪（loop） | 找一次 PR、把該審的都審完，算一輪 |
 | marker | agent 審完後留在 PR 上的隱藏留言，像書籤一樣記下審到哪個 commit |
-| `Full` / `Incremental` / `Skip` | 這一輪對某個 PR 的判斷：還沒審過 / 審過，但之後 head 變了 / 目前的 head 已經審過 |
+| `Full` / `Incremental` / `Skip` / `Unknown` | 這一輪對某個 PR 的判斷：還沒審過 / 審過，但之後 head 變了 / 目前的 head 已經審過 / 讀不到這個 PR，所以沒有判斷 |
 | cooldown | 撞到用量上限後，整輪先停下來等的那段時間 |
 | 換班（recycle） | daemon 定期把工作交給一個新的 daemon |
 | process group | 一個 process 和它開出來的子 process，要砍就一起砍 |
@@ -43,27 +44,45 @@ shell function 就是所謂的 wrapper，它會用 `BASH_FUNC_<name>%%` 把你�
 | 指令 | 做什麼 |
 |---|---|
 | `make` | 跑 `uv sync`，只把依賴裝進本地的 `.venv` |
-| `make install` | 裝 CLI 和 shell wrapper |
+| `make install` | 裝 CLI 和 shell wrapper。重裝（用這個或其他方式）前，先在 dashboard 按 `q` 停掉 daemon：還在跑的 daemon 是舊程式，下次換班會用新裝的檔案開接班的 daemon，對不上的話換班就會失敗，daemon 也跟著結束，原因寫在 `daemon.log` |
 | `make uninstall` | 移除上面兩樣，連 daemon 的 socket 目錄一起刪。daemon 還在跑的話它會拒絕，請先在 dashboard 按 `q`，或加 `FORCE=1` 強制執行。它不會動 `.tmp/auto-review-pr-dashboard/`；symlink 也只有在還指向這個 repo 時才刪 |
 | `make test` | 在 uv 環境裡跑測試 |
 | `make clean` | 刪掉 `.venv`、`__pycache__` 和產生出來的 `requirements.txt` |
 | `make requirements` | 選用：從 `uv.lock` 產生版本鎖死的 `requirements.txt` |
 
+`pr-discover` 不用 AppImage 的話，就從原始碼裝：clone
+[pr-discover](https://github.com/scott1028/pr-discover)，在它的目錄裡跑 `make install`。
+這需要 Python 3.10 以上和 uv，裝完 `pr-discover` 就在 `PATH` 上了。
+
 ## 每一輪 loop 做什麼
 
 每一輪都照同樣的四個步驟走：
 
-1. **找 PR**：每個搜尋條件各呼叫一次 `gh pr list`。每個 `--author` 查一次；每個 reviewer
-   則用 `review-requested:` 和 `reviewed-by:` 各查一次。結果合在一起，再去掉重複的。
-   要分開查，是因為 GitHub 會把同一個 `--search` 裡的條件全部 AND 起來。
-   兩種範圍都有給的話，符合任一邊的 PR 都會留下來。
-2. **判斷要不要審**：Draft，或標題有 `[WIP]` / `WIP:` 的 PR，直接判成 `Skip (WIP)`。
-   其他的用 `gh pr view --json headRefOid,comments` 找出最新一則
-   `<!-- review-pr-branches: head=<sha> -->` marker：沒有 marker 就是 `Full`，marker 的
-   SHA 跟現在的 head 不同就是 `Incremental`，相同就是 `Skip`。`Skip` 的 PR 一樣看得到，
-   只是不會派 agent。
+1. **找 PR**：交給 `pr-discover`。工具每一輪跑它一次，啟動時也先跑一次來檢查範圍。
+   - 工具從來不加 `--`，所以每次都是 dry run：它不派工，也不寫自己的狀態檔。
+   - 搜尋、Draft 和標題有 `[WIP]` / `WIP:` 的判斷都由它做。每個 `--reviewer` 會用
+     `review-requested:` 和 `reviewed-by:` 各查一次。
+   - 同時給了 `--author` 和 `--reviewer` 的話，PR 要兩邊都符合；`--pr-url` 指定的 PR
+     一律留下。
+   - `--dry-run` 的表和詳情頁上的 `matched:`，是它回報的 `matched_axes`，也就是哪些
+     搜尋條件找到這個 PR。舊版的 `pr-discover` 沒有這個欄位，這一行就是空的（詳情頁
+     顯示 `-`）。
+   - 整次 `pr-discover` 最多跑 `DISCOVER_TIMEOUT_SEC`（120 秒，在 `discover.py`），
+     這是整次執行的上限，不是每個 `gh` 呼叫各自算。
+2. **判斷要不要審**：每個 PR 都跑一次
+   `gh pr view --json title,author,headRefOid,comments`，標題、作者和 head 都以這次的
+   結果為準。
+   - `pr-discover` 判成 Draft 或 WIP 的 PR，直接是 `Skip (WIP)`。
+   - 其他的找出最新一則 `<!-- review-pr-branches: head=<sha> -->` marker：沒有 marker
+     就是 `Full`，marker 的 SHA 跟現在的 head 不同就是 `Incremental`，相同就是 `Skip`。
+     `Skip` 的 PR 一樣看得到，只是不會派 agent。
+   - 某個 PR 的 `gh pr view` 失敗時，只有它變成 `failed`，判斷顯示 `Unknown`；
+     `pr-discover` 已經跳過的 PR 則維持 skip。
+   - 每個 `gh` 呼叫最多等 `GH_TIMEOUT_SEC`（120 秒，在 `gate.py`）。
 3. **審**：剩下的 PR 每個派一個 agent，同時最多 `--parallel` 個，審查指示來自
-   `prompt.md`。
+   `prompt.md`。`--pr-timeout` 算的是 agent 本身；agent 結束後，輸出最多再收
+   `OUTPUT_DRAIN_SEC`（2 秒，在 `runner.py`），然後整個 process group 收到 SIGKILL，
+   所以 agent 留在背景的子 process 拖不住這個 PR。
 4. **記下貼了什麼**：每次跑之前和之後，各記一次 PR 上所有留言的 id，
    兩邊一比就知道新貼了什麼。這是以 GitHub 上的資料為準，不去解析 agent 的輸出。只有帶
    `review-pr-branches` marker 的留言才算數，所以隊友在中途貼的留言不會算進來。
@@ -101,9 +120,10 @@ stdin 交給接班的新 daemon。TUI 會等 `daemon.json` 出現新的 `run_id`
 
 ## 限制和特殊情況
 
-- daemon 如果沒有正常結束就死掉，它開的 agents 會繼續跑。下次啟動時，工具會照
-  `daemon.json` 裡的 `agent_groups` 砍掉那些 process group，pid 已經被別的 process
-  重用的會跳過。如果某個子孫 process 自己呼叫過 `setsid`，就管不到它了。
+- daemon 裡出了例外而崩潰時，一樣會停掉每個 agent，並把 traceback 寫進 `daemon.log`。
+  daemon 如果沒機會收尾就死掉（例如被 SIGKILL），它開的 agents 會繼續跑。下次啟動時，
+  工具會照 `daemon.json` 裡的 `agent_groups` 砍掉那些 process group，pid 已經被別的
+  process 重用的會跳過。如果某個子孫 process 自己呼叫過 `setsid`，就管不到它了。
 - log 面板只是記憶體裡的顯示，有上限，完整內容在 `.log` 檔裡。超過 2000 字元的行只顯示前
   2000 個字元，後面接 `(+N chars)`。
 - 面板最多留最後 2000 行，而且只有正在跑的 PR 會一直 buffer。`.log` 檔裡如果有超過 64KiB
@@ -112,7 +132,7 @@ stdin 交給接班的新 daemon。TUI 會等 `daemon.json` 出現新的 `run_id`
 ## 跑測試和發新版
 
 ```bash
-make test                               # 145 個測試,不連網
+make test                               # 237 個測試,不連網
 python3 -m unittest discover -s tests   # 同上,不用 uv
 ```
 

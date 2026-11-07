@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ from auto_review_pr_dashboard import runner as runner_module
 from auto_review_pr_dashboard.app import (
     MAX_BUFFERED_LOG_LINES,
     STATE_STYLE,
+    VERDICT_STYLE,
     AutoReviewPrDashboardApp,
     ConfirmQuitScreen,
     Dashboard,
@@ -27,15 +29,19 @@ from auto_review_pr_dashboard.app import (
 )
 from auto_review_pr_dashboard.config import RunConfig
 from auto_review_pr_dashboard.models import (
+    Classification,
     LoopRecord,
+    PostedComment,
+    PostKind,
     PrItem,
     PrState,
     SkipReason,
     Verdict,
 )
-from auto_review_pr_dashboard.session import (
+from auto_review_pr_dashboard.daemon import (
     PROTOCOL_VERSION,
     RuntimeMetadata,
+    SessionError,
     get_socket_path,
 )
 from auto_review_pr_dashboard.store import Store
@@ -753,6 +759,273 @@ class AppCoreTest(unittest.IsolatedAsyncioTestCase):
 # below, so those tests really do have a horizontal scrollbar to keep.
 WIDE_TITLE = "long title that keeps going for a while" * 2
 NARROW_TITLE = "medium width title"
+
+
+class DashboardAppTest(unittest.IsolatedAsyncioTestCase):
+    """Shared setup: an app on a temporary store, with no runner loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = RunConfig("codex-personal", "review", ["o/r"], ["me"], ["me"])
+        runner_patch = patch.object(
+            runner_module.LoopRunner, "run_forever", new=noop_forever
+        )
+        runner_patch.start()
+        self.addCleanup(runner_patch.stop)
+
+    def make_app(self, session=None):
+        return AutoReviewPrDashboardApp(
+            self.config, store=Store(Path(self.tmp.name)), session=session
+        )
+
+    def load_items(self, app, items):
+        record = LoopRecord(index=1, started_at=0.0, items=items)
+        app.runner.record = record
+        app.handle_runner_event("items_ready", (record,))
+
+    def get_toasts(self, app):
+        return [str(notification.message) for notification in app._notifications]
+
+    async def open_detail(self, app, pilot, key):
+        app.push_screen(DetailScreen(key))
+        await pilot.pause()
+        return app.screen
+
+
+class OutsideTextTest(DashboardAppTest):
+    """Text from GitHub, agents, or the daemon is shown as-is, never as markup."""
+
+    async def test_a_markup_like_title_renders_literally(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            self.load_items(app, [make_item(1, title="[/api] fix")])
+            await pilot.pause()
+            self.assertEqual(str(app.query_one(PrTable).get_row("o/r#1")[2]), "[/api] fix")
+            screen = await self.open_detail(app, pilot, "o/r#1")
+            meta = str(screen.query_one("#detail-meta", Static).content)
+            self.assertIn("[/api] fix", meta)
+
+    async def test_a_markup_like_pr_key_renders_literally(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            self.load_items(app, [make_item(1, repo="o/[/key]")])
+            await pilot.pause()
+            self.assertEqual(str(app.query_one(PrTable).get_row("o/[/key]#1")[1]), "o/[/key]#1")
+            app.show_activity_log("o/[/key]#1", True)
+            await pilot.pause()
+            panel = app.query_one("#activity-log", RichLog)
+            self.assertEqual(panel._border_title.plain, "agent log · o/[/key]#1")
+
+    async def test_a_markup_like_log_line_renders_literally(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            item = make_item(1, state=PrState.RUNNING)
+            item.started_at = time.time()
+            self.load_items(app, [item])
+            app.show_activity_log("o/r#1", True)
+            screen = await self.open_detail(app, pilot, "o/r#1")
+            app.handle_runner_event("log", ("o/r#1", "[/api]"))
+            await pilot.pause()
+            log_lines = [line.text for line in screen.query_one("#detail-log", RichLog).lines]
+            self.assertIn("[/api]", log_lines)
+            panel = app.query_one("#activity-log", RichLog)
+            self.assertIn("[/api]", [line.text for line in panel.lines])
+
+    async def test_a_markup_like_error_renders_literally(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            item = make_item(1, state=PrState.FAILED)
+            item.error = "[bold"
+            self.load_items(app, [item])
+            screen = await self.open_detail(app, pilot, "o/r#1")
+            meta = str(screen.query_one("#detail-meta", Static).content)
+            posts = str(screen.query_one("#detail-posts", Static).content)
+            self.assertIn("[bold", meta)
+            self.assertIn("Failed: [bold; nothing posted.", posts)
+
+    async def test_a_markup_like_headline_renders_literally(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            item = make_item(1, state=PrState.DONE)
+            item.new_posts = [
+                PostedComment(
+                    kind=PostKind.INLINE,
+                    comment_id=1,
+                    url="https://github.com/o/r/pull/1#r1",
+                    classification=Classification.BLOCKING,
+                    headline="[/x]",
+                )
+            ]
+            self.load_items(app, [item])
+            screen = await self.open_detail(app, pilot, "o/r#1")
+            posts = str(screen.query_one("#detail-posts", Static).content)
+            self.assertIn("[/x]", posts)
+
+    async def test_block_reason_scope_and_runner_errors_render_literally(self):
+        self.config.repos = ["o/[/r]"]
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            self.load_items(app, [make_item(1)])
+            app.handle_runner_event("blocked", ("[/api] limit", time.time() + 60))
+            app.handle_runner_event("error", ("discovery failed: [/x] boom",))
+            await pilot.pause()
+            dashboard = str(app.query_one(Dashboard).content)
+            self.assertIn("[/api] limit", dashboard)
+            self.assertIn("o/[/r]", dashboard)
+            self.assertIn("blocked: [/api] limit", self.get_toasts(app))
+            self.assertIn("discovery failed: [/x] boom", self.get_toasts(app))
+
+    async def test_daemon_messages_render_literally(self):
+        app = self.make_app(FakeSession(self.config))
+        evil = "pr-discover says [/api] and [/usr/bin/x]"
+        async with app.run_test(notifications=True) as pilot:
+            await pilot.pause()
+            app.handle_session_message({"type": "notice", "message": f"notice {evil}"})
+            app.handle_session_message({"type": "error", "message": f"error {evil}"})
+            await pilot.pause()
+            app.handle_session_message(
+                {"type": "error", "message": f"fatal {evil}", "fatal": True}
+            )
+            await pilot.pause()
+        for text in (f"notice {evil}", f"error {evil}", f"fatal {evil}"):
+            self.assertIn(text, self.get_toasts(app))
+        self.assertEqual(app.return_value, "connection-error")
+        self.assertEqual(app.exit_message, f"fatal {evil}")
+
+    async def test_a_connect_failure_is_shown_literally_and_kept_for_main(self):
+        session = FakeSession(self.config)
+
+        async def refuse(_on_message):
+            raise SessionError("socket [/x] is gone")
+
+        session.connect = refuse
+        app = self.make_app(session)
+        async with app.run_test(notifications=True) as pilot:
+            await pilot.pause()
+        self.assertEqual(app.return_value, "connection-error")
+        self.assertEqual(app.exit_message, "socket [/x] is gone")
+        self.assertIn("socket [/x] is gone", self.get_toasts(app))
+
+    async def test_app_markup_still_renders(self):
+        app = self.make_app(FakeSession(self.config))
+        async with app.run_test(notifications=True) as pilot:
+            item = make_item(1, state=PrState.RUNNING)
+            item.started_at = time.time()
+            app.handle_session_message(
+                FakeSession(self.config, LoopRecord(1, 0.0, items=[item])).snapshot
+            )
+            await pilot.pause()
+            await pilot.press("q")
+            await pilot.pause()
+            content = app.screen.query_one("#confirm-quit-message", Static).content
+            # The app's own emphasis: "d" in bold, not literal brackets.
+            self.assertIn("Press d instead", content.plain)
+            self.assertIn(
+                ("d", "b"),
+                [(content.plain[span.start : span.end], str(span.style)) for span in content.spans],
+            )
+
+    async def test_a_gate_failed_pr_shows_unknown_and_is_not_counted_as_full(self):
+        app = self.make_app()
+        async with app.run_test(notifications=True) as pilot:
+            failed = make_item(1, state=PrState.FAILED, verdict=Verdict.UNKNOWN)
+            failed.error = "gate check failed: gh pr view failed: 502"
+            self.load_items(app, [failed, make_item(2)])
+            await pilot.pause()
+            verdict_cell = app.query_one(PrTable).get_row("o/r#1")[3]
+            self.assertEqual(verdict_cell.plain, "Unknown")
+            self.assertEqual(str(verdict_cell.style), VERDICT_STYLE[Verdict.UNKNOWN])
+            dashboard = str(app.query_one(Dashboard).content)
+            self.assertIn("Full 1 · Incremental 0 · Skip 0 · Cancelled 0 · Failed 1", dashboard)
+            self.assertNotIn("Unknown", dashboard)
+            screen = await self.open_detail(app, pilot, "o/r#1")
+            self.assertIn("Verdict Unknown", str(screen.query_one("#detail-meta", Static).content))
+
+
+class ExitMessageTest(DashboardAppTest):
+    async def test_disconnected_keeps_the_reason(self):
+        app = self.make_app(FakeSession(self.config))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.handle_session_message(
+                {"type": "disconnected", "message": "connection to background daemon closed"}
+            )
+            await pilot.pause()
+        self.assertEqual(app.return_value, "disconnected")
+        self.assertEqual(app.exit_message, "connection to background daemon closed")
+
+    async def test_the_first_fatal_reason_wins(self):
+        # A daemon refusing the attach sends a fatal error, then closes the socket.
+        app = self.make_app(FakeSession(self.config))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app.handle_session_message(
+                {"type": "error", "message": "client run id does not match daemon", "fatal": True}
+            )
+            app.handle_session_message(
+                {"type": "disconnected", "message": "connection to background daemon closed"}
+            )
+            await pilot.pause()
+        self.assertEqual(app.return_value, "connection-error")
+        self.assertEqual(app.exit_message, "client run id does not match daemon")
+
+    async def test_a_reattach_that_gives_up_keeps_the_reason(self):
+        app = self.make_app(FakeSession(self.config))
+        with (
+            patch.object(app_module, "load_runtime_metadata", return_value=None),
+            patch.object(app_module, "RECYCLE_REATTACH_TIMEOUT_SEC", 0.3),
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.handle_session_message({"type": "recycling", "message": "restarting"})
+                app.handle_session_message({"type": "disconnected", "message": "closed"})
+                await pilot.pause(0.6)
+        self.assertEqual(app.return_value, "disconnected")
+        self.assertIn("did not become attachable", app.exit_message)
+
+    async def test_quit_then_the_daemon_closing_still_ends_as_stopped(self):
+        session = FakeSession(self.config)
+        app = self.make_app(session)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("q")
+            # The daemon closes its socket because q told it to.
+            app.handle_session_message(
+                {"type": "disconnected", "message": "connection to background daemon closed"}
+            )
+            await pilot.pause()
+        self.assertEqual(session.commands, [("stop", None)])
+        self.assertEqual(app.return_value, "stopped")
+        self.assertEqual(app.exit_message, "")
+
+    async def test_reattach_waits_until_a_new_run_id_appears(self):
+        old_session = FakeSession(self.config, run_id="old-run")
+        new_session = FakeSession(self.config, run_id="new-run")
+        app = self.make_app(old_session)
+        # The recycling daemon's own metadata is still there for a while.
+        metadata = itertools.chain(
+            [make_metadata("old-run")] * 3, itertools.repeat(make_metadata("new-run"))
+        )
+        with (
+            patch.object(
+                app_module, "load_runtime_metadata", side_effect=lambda _store: next(metadata)
+            ),
+            patch.object(app_module, "get_resume_error", return_value=""),
+            patch.object(
+                app_module, "SessionClient", return_value=new_session
+            ) as session_client,
+        ):
+            async with app.run_test() as pilot:
+                await pilot.pause()
+                app.handle_session_message({"type": "recycling", "message": "restarting"})
+                app.handle_session_message({"type": "disconnected", "message": "closed"})
+                await pilot.pause(1.0)
+                self.assertIs(app.session, new_session)
+
+        self.assertEqual(
+            [call.args[0].run_id for call in session_client.call_args_list], ["new-run"]
+        )
 
 
 class PrTableRefreshTest(unittest.IsolatedAsyncioTestCase):
