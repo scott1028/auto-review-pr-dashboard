@@ -96,6 +96,36 @@ jobs:
             -p "python3.12.*-cp312-cp312-manylinux2014_$(uname -m).AppImage" -D "$RUNNER_TEMP/base"
           # python-appimage runs a local base image as is.
           chmod +x "$RUNNER_TEMP"/base/*.AppImage
+      - name: Pin appimagetool
+        # python-appimage 1.4.6 always fetches appimagetool "continuous", which changed under
+        # us. It reuses a cached AppRun, so put a wrapper there that runs a pinned 1.9.1.
+        run: |
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64) sha256=ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 ;;
+            aarch64) sha256=f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158 ;;
+            *) echo "no pinned appimagetool for $arch" >&2; exit 1 ;;
+          esac
+          bin="$HOME/.cache/python-appimage/bin"
+          tool="$bin/appimagetool-1.9.1.$arch"
+          curl -fsSL -o "$RUNNER_TEMP/appimagetool.AppImage" \
+            "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$arch.AppImage"
+          echo "$sha256  $RUNNER_TEMP/appimagetool.AppImage" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/appimagetool.AppImage"
+          (cd "$RUNNER_TEMP" && ./appimagetool.AppImage --appimage-extract > /dev/null)
+          mkdir -p "$bin" "$bin/.appimagetool-continuous.appdir.$arch"
+          mv "$RUNNER_TEMP/squashfs-root" "$tool"
+          # python-appimage makes its AppDir with mkdtemp (0700), but an AppImage must be
+          # readable by other users, so open it up before the real tool packs it.
+          printf '%s\n' '#!/bin/sh' \
+            'for arg in "$@"; do' \
+            '  case "$arg" in -*) ;; *) appdir=$arg; break ;; esac' \
+            'done' \
+            'echo "appimagetool wrapper: chmod -R a+rX $appdir"' \
+            'chmod -R a+rX "${appdir:?no AppDir argument}"' \
+            "exec \"$tool/AppRun\" \"\$@\"" \
+            > "$bin/.appimagetool-continuous.appdir.$arch/AppRun"
+          chmod +x "$bin/.appimagetool-continuous.appdir.$arch/AppRun"
       - name: Build AppImage
         env:
           PIP_CONSTRAINT: ${{ runner.temp }}/constraints.txt
